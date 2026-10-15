@@ -85,6 +85,10 @@ def main():
         subprocess.run(argv, cwd=ROOT, env=env, check=True, timeout=timeout)
 
     try:
+        # All tests use a prebuilt immutable image. Runs never pull/build/install.
+        from scripts.build_execution_image import build
+
+        env["AGENT_TEST_EXECUTION_IMAGE"] = build()
         command(compose + ["up", "-d", "--wait"], timeout=300)
         command([sys.executable, "-m", "db.migrate"])
         command([sys.executable, "-m", "db.bootstrap"])
@@ -99,7 +103,7 @@ def main():
                 "--junitxml",
                 str(report),
             ],
-            timeout=300,
+            timeout=900,
         )
         counts = validate_report(report)
         (output / "summary.json").write_text(json.dumps(counts, indent=2))

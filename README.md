@@ -1,10 +1,10 @@
 # Agent 执行框架
 
-本机运行的任务 API、异步 Worker 和 PostgreSQL 持久化。执行层使用 LangChain `create_agent`、原生消息状态、PostgreSQL Checkpointer 和摘要中间件。生产工具列表为空；当前不提供文件、命令、RAG、个人长期记忆或代码审查功能。
+本机运行的任务 API、异步 Worker 和 PostgreSQL 持久化。执行层使用 LangChain `create_agent`、原生消息状态、PostgreSQL Checkpointer 和摘要中间件。提供空工具聊天、容器内工作区搜索读取和文件修改/Shell 三种内置 Profile。所有工作区工具在 Docker 中运行，直接修改注册目录。
 
 ## 安装与初始化
 
-需要 Python 3.12、普通 PostgreSQL 16 和兼容 OpenAI Chat Completions 的模型端点。LangChain 1.4.2、LangGraph 1.2.12、Checkpoint Postgres 3.1.2 保持锁定。
+需要 Python 3.12、普通 PostgreSQL 16 和兼容 OpenAI Chat Completions 的模型端点。工作区工具另需同一 Linux 主机的 Docker daemon；多个 Worker 必须连接同一数据库与同一 daemon。LangChain 1.4.2、LangGraph 1.2.12、Checkpoint Postgres 3.1.2 保持锁定。
 
 ```bash
 python3.12 -m venv .venv
@@ -16,7 +16,7 @@ export AGENT_DATABASE_URL='postgresql://agent_runtime:RUNTIME_PASSWORD@127.0.0.1
 .venv/bin/python -m db.doctor --json
 ```
 
-请预先创建空数据库。迁移 owner 需要创建表；bootstrap 还需要创建运行角色的权限。运行角色必须与 owner 分离，无 schema、数据库创建权或 revision 写权限。迁移通过单条 Alembic 链 `core_0001 → core_0002` 创建/升级核心表，版本权威为 `agent.alembic_version`，并调用框架 Checkpointer 的 `setup()`；重复执行安全，API/Worker 不执行 DDL。
+请预先创建空数据库。迁移 owner 需要创建表；bootstrap 还需要创建运行角色的权限。运行角色必须与 owner 分离，无 schema、数据库创建权或 revision 写权限。迁移通过单条 Alembic 链 `core_0001 → core_0002 → core_0003` 创建/升级核心表，版本权威为 `agent.alembic_version`，并调用框架 Checkpointer 的 `setup()`；重复执行安全，API/Worker 不执行 DDL。
 
 迁移接受空库、结构匹配的当前 `agent_core_0001` 核心库及已知 Alembic revision。旧核心库先经只读结构/标识校验，再登记 core_0001 并升级；历史会话与 Run 回填 chat 绑定，历史模型配置保持 null。旧业务 schema、未知 revision、未知非空库、结构不匹配库在任何 DDL 和权限修改前拒绝。checkpoint 表继续由框架维护。
 
@@ -50,7 +50,7 @@ curl -X POST http://127.0.0.1:8002/v1/conversations/CONVERSATION_UUID/turns \
 
 ## 配置
 
-可选 `AGENT_RUNTIME_CONFIG` 指向 TOML 文件，由标准库 tomllib 读取并通过 Pydantic 校验，仅启动加载。参见 [配置示例](config/runtime.example.toml)。未指定时继续使用空工具的内置 chat；chat 不可覆写。API 和 Worker 使用一致的注册配置，API 无需模型 Key 或模型端点。
+可选 `AGENT_RUNTIME_CONFIG` 指向 TOML 文件，由标准库 tomllib 读取并通过 Pydantic 校验，仅启动加载。参见 [配置示例](config/runtime.example.toml)。未指定时继续使用空工具的内置 chat；三个内置 Profile 均不可覆写。API 和 Worker 使用一致的注册配置，API 无需模型 Key 或模型端点。
 
 ```bash
 export AGENT_RUNTIME_CONFIG=/absolute/path/to/runtime.toml
@@ -59,7 +59,7 @@ curl -X POST http://127.0.0.1:8002/v1/runs \
   -d '{"task":"讨论项目","profile":"project-chat","workspace_id":"project"}'
 ```
 
-配置只声明版本、工作区和 profile。生产注册工具仍为空，不可通过 TOML 或 HTTP 指定 Python 模块、工具实现、middleware、状态或输出 Schema。未知工具、保留名称冲突、非法根目录导致启动失败。修改配置后按上述停止/重启流程上线；不支持热更新。
+配置声明版本、工作区、Profile 和受限的 execution 配置。工具仅能选用启动时的可信注册表，不可通过 TOML 或 HTTP 指定 Python 模块、工具实现、middleware、状态或输出 Schema。未知工具、保留名称冲突、非法根目录导致启动失败。修改配置后按上述停止/重启流程上线；不支持热更新。
 
 以下配置均使用 `AGENT_` 前缀，数值为正。时间单位为秒，token 数为框架估算值。
 
@@ -69,7 +69,7 @@ curl -X POST http://127.0.0.1:8002/v1/runs \
 | `AGENT_RUN_TIMEOUT` | 300 | 首次认领后的总执行期限，包含摘要、模型、工具和等待 |
 | `AGENT_MODEL_TIMEOUT_SECONDS` | 120 | 单次 SDK 请求超时 |
 | `AGENT_MAX_OUTPUT_TOKENS` | 4096 | 模型最大输出长度 |
-| `AGENT_MAX_ACTIVE_RUNS` | 2 | 全局运行/取消中任务上限 |
+| `AGENT_MAX_ACTIVE_RUNS` | 2 | 全局活动 Run 与未释放执行资源的 Run 上限（去重） |
 | `AGENT_MAX_QUEUED_RUNS` | 8 | 全局排队上限 |
 | `AGENT_MAX_UNFINISHED_RUNS` | 10 | 全局未完成任务上限 |
 | `AGENT_SUMMARY_TRIGGER_TOKENS` | 20000 | 摘要触发阈值 |
@@ -93,6 +93,53 @@ curl -X POST http://127.0.0.1:8002/v1/runs \
 .venv/bin/python -m db.trace_run RUN_UUID
 ```
 
-测试入口使用普通 `postgres:16`，生成独立凭据，覆盖继承的生产配置，阻止真实 HTTP，通过合成模型与标准工具验证执行。测试报告必须非空、零失败、零错误、零跳过。新测试直接 `pytest` 也启用 HTTP 禁令；数据库用例必须由隔离入口配置的 `AGENT_TEST_DATABASE=1` 执行。
+测试入口使用普通 `postgres:16`，生成独立凭据，覆盖继承的生产配置，阻止真实 HTTP，预先构建执行镜像，通过合成模型、真实 PostgreSQL 和真实 Docker 验证执行。缺少必要环境直接失败。测试报告必须非空、零失败、零错误、零跳过。新测试直接 `pytest` 也启用 HTTP 禁令；数据库用例必须由隔离入口配置的 `AGENT_TEST_DATABASE=1` 执行。
 
 诊断使用原生 checkpoint 历史、消息、生命周期事件和 Worker 结构化日志。trace 同时提供提交绑定和实际运行摘要；摘要按白名单记录模型、脱敏端点、提示词/工具 Schema 指纹、中间件配置及框架版本，不保存密钥或 DSN。异常退出或失租的在途任务标记失败，不重放模型/工具；checkpoint 留供诊断。发布提交确认丢失时仅查询/重试结果发布，不重新执行 Agent。
+
+## 工作区工具与镜像
+
+部署前构建镜像，然后将命令最后输出的 `sha256:...` ID 写入 TOML 的 `[execution].image`。构建使用固定 Python 镜像 digest、Debian snapshot 和现有完整依赖锁文件。Run 中不会构建、拉取镜像或安装依赖。
+
+```bash
+.venv/bin/python -m scripts.build_execution_image
+export AGENT_RUNTIME_CONFIG=/absolute/path/to/runtime.toml
+.venv/bin/python -m db.config_check --role agent-worker
+```
+
+| Profile | 工具 | 工作区 |
+| --- | --- | --- |
+| `chat` | 无 | 不启动 Docker；可不绑定工作区 |
+| `workspace_read` | `glob_search`、`grep_search`、`read_file` | 必须绑定；只读挂载 |
+| `workspace_write` | 上述工具、`edit_file`、`shell` | 必须绑定；读写挂载 |
+
+自定义 Profile 可选择这些工具的子集；包含 edit_file 或 shell 时使用读写挂载，其余子集只读。内置搜索复用锁定版本的 `FilesystemFileSearchMiddleware`，在容器内调用，固定使用 rg；Shell 复用 `ShellToolMiddleware` 和派生 Docker 策略。兼容实现集中在 [execution_adapter.py](agent_service/execution_adapter.py)。
+
+```bash
+curl -X POST http://127.0.0.1:8002/v1/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"task":"查找测试入口并读取相关文件","profile":"workspace_read","workspace_id":"project"}'
+```
+
+文件路径相对于工作区，`/foo` 也表示工作区下的 foo。read_file 提供 UTF-8 内容、行号、SHA-256、总行数与截断标志，默认最多 200 行；可用 start_line/max_lines 分段读取。edit_file 使用 create=true/new_text 创建且不覆盖，或使用 expected_hash/old_text/new_text 作唯一文本替换；冲突作为可恢复工具错误反馈。文件大小上限默认 10 MiB；读写拒绝符号链接、目录穿越及特殊文件，修改以同目录临时文件原子发布。搜索同时执行原生路径检查，不读取越界链接。Shell 的 cwd 和变量仅在当前 Run 内保留，禁止显式重启；普通非零退出码为工具错误，模型可调整命令。
+
+容器固定关闭网络、根文件系统只读、移除 capabilities、禁止提权，只挂载本次工作区。默认 1 CPU、512 MiB、128 PID、独立 64 MiB /tmp；使用 Worker 非 root UID:GID，root Worker 必须显式配置非 root user。容器进程只接收固定环境白名单，不继承服务密钥。所有工具最终返回内容（含包装文字）最多 16 KiB、200 行，artifact 保留退出码、哈希和截断标志。单个工具默认期限 30 秒且不超过 Run 剩余期限；超时终止环境并使 Run 失败，不重启 Shell。容器 PID 1 同时执行 Run 绝对截止时间。
+
+**直接修改注册工作区；失败、取消及超时保留已经发生的修改，不自动回滚。** 不同 Run 不继承容器、Shell cwd、变量或后台进程；成功会话轮次仅继承消息。异常任务不自动重放，不恢复旧 Agent。
+
+## 执行资源恢复与诊断
+
+认领 Run 和预留 execution_resources 在同一数据库 advisory lock 事务中完成。规范路径、别名及父子重叠目录独占；冲突任务继续排队，并受 60 秒排队期限约束；Worker 可选择后续不冲突任务。不同目录允许并行，默认全局容量 2。终态任务的未释放资源仍占容量和工作区。
+
+启动顺序为预留 → 创建停止态容器 → 持久化 ID → 按 ID 启动。所有退出路径先关闭工具入口，再移除容器、收敛本地 Docker 客户端和 Shell 线程，最后确认资源释放。成功仅在清理确认后发布，清理和发布期间继续续租。取消和失租竞争仍由数据库最终发布检查裁决。
+
+Worker 启动与轮询时清理遗留资源，仅处理本项目数据库记录与容器标签同时匹配的对象，不重放模型或工具。执行 `python -m db.doctor --json` 可查看未释放资源的 phase、state、daemon_id、container_id 和 cleanup_error；timeline 增加 environment_preparing、environment_active、environment_closing、environment_cleanup_failed、environment_released 和 environment_recovered 事件。trace 保留标准 ToolMessage 和有效配置摘要，无容器句柄或密钥。
+
+| 错误码 | 含义与处理 |
+| --- | --- |
+| `COMMAND_TIMEOUT` | 单个工具超时；环境关闭，任务失败 |
+| `EXECUTION_ENVIRONMENT_UNAVAILABLE` | Docker、固定镜像或辅助程序无法准备；检查配置和 daemon |
+| `EXECUTION_ENVIRONMENT_LOST` | 容器/Shell/辅助进程异常退出或内存限制触发 |
+| `RESOURCE_CLEANUP_FAILED` | 执行结束后未确认清理；不发布 completed，保留占用 |
+
+清理默认等待 10 秒。Docker 不可达时恢复同一 daemon 后 Worker 自动重试；daemon ID 不匹配时必须恢复原 daemon。创建结果未知且容器不可见时，不能以一次 inspect 未找到为由释放资源；诊断保留 creating 与 unknown 原因。没有 HTTP 强制解锁入口。请先恢复基础设施并核对数据库记录和 Docker 状态；不要删除占用记录来绕过并发保护。

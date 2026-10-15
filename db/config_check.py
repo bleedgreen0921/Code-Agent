@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import os
 
 from agent_service.config import Settings
@@ -10,7 +11,11 @@ def main():
     parser.add_argument("--role", choices=("agent-api", "agent-worker"), required=True)
     args = parser.parse_args()
     Settings.from_env()
-    Registry.from_env()
+    registry = Registry.from_env()
+    if args.role == "agent-worker" and registry.execution.image:
+        from agent_service.execution import check_environment
+
+        asyncio.run(check_environment(registry.execution))
     names = ["AGENT_DATABASE_URL"]
     if args.role == "agent-worker":
         names += ["AGENT_MODEL_URL", "AGENT_MODEL"]

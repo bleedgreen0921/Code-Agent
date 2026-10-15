@@ -3,6 +3,9 @@
 import logging
 from contextlib import asynccontextmanager
 from uuid import uuid4
+from pathlib import Path
+
+from agent_service.execution_config import WORKSPACE_TOOLS
 
 from contracts.errors import ApiError
 from contracts.v1 import ErrorCode
@@ -32,9 +35,10 @@ class Store:
             revisions = await (
                 await conn.execute("SELECT version_num FROM agent.alembic_version")
             ).fetchall()
-            if revisions != [{"version_num": "core_0002"}]:
+            if revisions != [{"version_num": "core_0003"}]:
                 raise RuntimeError("Core database baseline required")
             await conn.execute("SELECT 1 FROM agent.checkpoints LIMIT 1")
+            await conn.execute("SELECT run_id FROM agent.execution_resources LIMIT 1")
             privileges = await (
                 await conn.execute("""SELECT has_schema_privilege(current_user,'agent','CREATE') AS ddl,
                 has_database_privilege(current_user,current_database(),'CREATE') AS db_ddl,
@@ -322,33 +326,149 @@ class Store:
     async def claim(self, worker_id):
         async with self.locked() as conn:
             await self.sweep(conn)
+            occupied = await (
+                await conn.execute(
+                    "SELECT run_id,workspace_root FROM agent.execution_resources WHERE state <> 'released'"
+                )
+            ).fetchall()
             n = (
                 await (
-                    await conn.execute(
-                        "SELECT count(*) AS n FROM agent.runs WHERE status IN ('running','cancelling')"
-                    )
+                    await conn.execute("""SELECT count(*) AS n FROM (
+                SELECT id FROM agent.runs WHERE status IN ('running','cancelling')
+                UNION SELECT run_id FROM agent.execution_resources WHERE state <> 'released'
+            ) capacity""")
                 ).fetchone()
             )["n"]
             if n >= self.settings.max_active_runs:
                 return None
+            queued = await (
+                await conn.execute(
+                    "SELECT * FROM agent.runs WHERE status='queued' ORDER BY created_at,id"
+                )
+            ).fetchall()
+            selected, root = None, None
+            for candidate in queued:
+                candidate_root = None
+                try:
+                    profile = self.registry.resolve(candidate["submitted_binding"])
+                    if set(profile.tools) & WORKSPACE_TOOLS:
+                        candidate_root = self.registry.workspaces[
+                            candidate["workspace_id"]
+                        ]
+                except (RuntimeError, ValueError, KeyError):
+                    # Claim changed bindings so the Worker publishes CONFIGURATION_CHANGED.
+                    pass
+                if candidate_root and any(
+                    Path(candidate_root).is_relative_to(item["workspace_root"])
+                    or Path(item["workspace_root"]).is_relative_to(candidate_root)
+                    for item in occupied
+                ):
+                    continue
+                selected, root = candidate, candidate_root
+                break
+            if selected is None:
+                return None
+            token = uuid4()
             row = await (
                 await conn.execute(
                     """UPDATE agent.runs SET status='running',worker_id=%s,lease_token=%s,
                 started_at=clock_timestamp(),deadline_at=clock_timestamp()+%s*interval '1 second',
-                lease_until=clock_timestamp()+%s*interval '1 second'
-                WHERE id=(SELECT id FROM agent.runs WHERE status='queued' ORDER BY created_at,id LIMIT 1)
+                lease_until=clock_timestamp()+%s*interval '1 second' WHERE id=%s
                 RETURNING *,extract(epoch FROM (deadline_at-clock_timestamp())) AS remaining""",
                     (
                         worker_id,
-                        uuid4(),
+                        token,
                         self.settings.run_timeout,
                         self.settings.lease_seconds,
+                        selected["id"],
                     ),
                 )
             ).fetchone()
-            if row:
-                await self.event(conn, row["id"], "running")
+            if root:
+                # Database identity is included in names/labels to isolate projects sharing a daemon.
+                identity = (
+                    await (
+                        await conn.execute("SELECT current_database() AS name")
+                    ).fetchone()
+                )["name"]
+                from agent_service.profiles import fingerprint
+
+                name = "agent-exec-" + fingerprint(identity)[:12] + "-" + row["id"].hex
+                await conn.execute(
+                    """INSERT INTO agent.execution_resources
+                    (run_id,lease_token,worker_id,workspace_root,container_name) VALUES(%s,%s,%s,%s,%s)""",
+                    (row["id"], token, worker_id, root, name),
+                )
+            await self.event(conn, row["id"], "running")
         return row
+
+    async def execution_resource(self, run_id):
+        async with self.pool.connection() as conn:
+            return await (
+                await conn.execute(
+                    "SELECT * FROM agent.execution_resources WHERE run_id=%s", (run_id,)
+                )
+            ).fetchone()
+
+    async def resource_update(
+        self, run_id, token, *, require_live=False, recovered=False, **changes
+    ):
+        allowed = {"daemon_id", "container_id", "state", "phase", "cleanup_error"}
+        if not changes or changes.keys() - allowed:
+            raise ValueError("Invalid execution resource update")
+        from psycopg import sql
+
+        async with self.locked() as conn:
+            suffix = sql.SQL("")
+            if require_live:
+                suffix = sql.SQL(""" AND EXISTS(SELECT 1 FROM agent.runs r WHERE r.id=e.run_id
+                    AND r.lease_token=e.lease_token AND r.status='running'
+                    AND r.lease_until>clock_timestamp() AND r.deadline_at>clock_timestamp())
+                    AND e.state IN ('reserved','active')""")
+            assignments = sql.SQL(",").join(
+                sql.SQL("{}=%s").format(sql.Identifier(k)) for k in changes
+            )
+            statement = sql.SQL("""UPDATE agent.execution_resources e SET {},updated_at=clock_timestamp(),
+                released_at=CASE WHEN %s='released' THEN clock_timestamp() ELSE released_at END
+                WHERE e.run_id=%s AND e.lease_token=%s AND e.state<>'released' {} RETURNING e.*""").format(
+                assignments, suffix
+            )
+            result = await (
+                await conn.execute(
+                    statement, (*changes.values(), changes.get("state"), run_id, token)
+                )
+            ).fetchone()
+            if result and "state" in changes:
+                await self.event(
+                    conn,
+                    run_id,
+                    "environment_" + changes["state"],
+                    "RESOURCE_CLEANUP_FAILED"
+                    if changes["state"] == "cleanup_failed"
+                    else None,
+                )
+            if result and changes.get("phase") == "creating":
+                await self.event(conn, run_id, "environment_preparing")
+            if result and recovered and changes.get("state") == "released":
+                await self.event(conn, run_id, "environment_recovered")
+            return result
+
+    async def orphan_resources(self):
+        async with self.pool.connection() as conn:
+            return await (
+                await conn.execute("""SELECT e.* FROM agent.execution_resources e
+                JOIN agent.runs r ON r.id=e.run_id WHERE e.state<>'released'
+                AND (r.status IN ('failed','cancelled','completed') OR r.lease_until<=clock_timestamp())
+                ORDER BY e.created_at""")
+            ).fetchall()
+
+    async def resource_diagnostics(self):
+        async with self.pool.connection() as conn:
+            return await (
+                await conn.execute("""SELECT run_id,worker_id,workspace_root,daemon_id,
+                container_name,container_id,state,phase,cleanup_error,updated_at
+                FROM agent.execution_resources WHERE state<>'released' ORDER BY created_at""")
+            ).fetchall()
 
     async def renew(self, run_id, token):
         async with self.pool.connection() as conn:
@@ -407,6 +527,14 @@ class Store:
                     raise ValueError(
                         "A completed Run requires an answer and explicit final checkpoint"
                     )
+                occupied = await (
+                    await conn.execute(
+                        "SELECT 1 FROM agent.execution_resources WHERE run_id=%s AND state<>'released'",
+                        (run_id,),
+                    )
+                ).fetchone()
+                if occupied:
+                    return False
                 status = "completed"
             published = await (
                 await conn.execute(

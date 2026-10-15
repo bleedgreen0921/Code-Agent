@@ -13,6 +13,13 @@ from typing import Any, Literal
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent_service.execution_config import (
+    ExecutionSettings,
+    WORKSPACE_TOOLS,
+    IMPLEMENTATION_VERSION,
+)
+from agent_service.workspace_tools import builtin_tools
+
 
 def fingerprint(value):
     return hashlib.sha256(
@@ -47,6 +54,7 @@ class RuntimeFile(Declaration):
     version: Literal[1]
     workspaces: list[Workspace] = []
     profiles: list[Profile] = []
+    execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
 
 
 @dataclass(frozen=True)
@@ -76,6 +84,7 @@ class PermissionPolicy:
 
 class Registry:
     def __init__(self, config=None, *, tools=(), validators=None, extensions=None):
+        tools = (*builtin_tools(), *tools)
         self.tools = MappingProxyType({t.name: t for t in tools})
         if len(self.tools) != len(tools):
             raise ValueError("Duplicate tool names")
@@ -84,7 +93,20 @@ class Registry:
         if "chat" in self.extensions:
             raise ValueError("chat is reserved")
         config = config or RuntimeFile(version=1)
-        profiles = {"chat": Profile(id="chat")}
+        self.execution = config.execution
+        profiles = {
+            "chat": Profile(id="chat"),
+            "workspace_read": Profile(
+                id="workspace_read",
+                tools=("glob_search", "grep_search", "read_file"),
+                requires_workspace=True,
+            ),
+            "workspace_write": Profile(
+                id="workspace_write",
+                tools=("glob_search", "grep_search", "read_file", "edit_file", "shell"),
+                requires_workspace=True,
+            ),
+        }
         workspaces = {}
         for workspace in config.workspaces:
             root = Path(workspace.root)
@@ -131,7 +153,9 @@ class Registry:
         declaration = self.profiles[profile]
         if workspace_id is not None and workspace_id not in self.workspaces:
             raise ValueError("Unknown workspace")
-        if declaration.requires_workspace and workspace_id is None:
+        if (
+            declaration.requires_workspace or set(declaration.tools) & WORKSPACE_TOOLS
+        ) and workspace_id is None:
             raise ValueError("Profile requires a workspace")
         root = self.workspaces.get(workspace_id)
         tool_schemas = {
@@ -149,6 +173,14 @@ class Registry:
                         profile, Extension()
                     ).version,
                     "tool_schemas": tool_schemas,
+                    **(
+                        {
+                            "execution": self.execution.model_dump(),
+                            "tool_implementation": IMPLEMENTATION_VERSION,
+                        }
+                        if set(declaration.tools) & WORKSPACE_TOOLS
+                        else {}
+                    ),
                 }
             ),
             "workspace_id": workspace_id,
@@ -167,10 +199,10 @@ class Registry:
             raise ConfigurationChanged("Submitted configuration changed")
         return self.profiles[current["profile"]]
 
-    def policy(self, binding):
+    def policy(self, binding, *, actual_tools=None):
         profile = self.resolve(binding)
         return PermissionPolicy(
-            {name: self.tools[name] for name in profile.tools},
+            {name: (actual_tools or self.tools)[name] for name in profile.tools},
             {
                 name: self.validators[name]
                 for name in profile.tools

@@ -65,6 +65,8 @@ def build_agent(
     state_schema=None,
     response_format=None,
     permission_policy: PermissionPolicy | None = None,
+    execution_middleware=(),
+    output_limits=None,
 ):
     cfg = settings or Settings.from_env()
     return create_agent(
@@ -77,7 +79,7 @@ def build_agent(
         state_schema=state_schema,
         response_format=response_format,
         middleware=[
-            ToolLifecycleMiddleware(),
+            ToolLifecycleMiddleware(output_limits),
             ModelCallLimitMiddleware(run_limit=16, exit_behavior="error"),
             ToolCallLimitMiddleware(run_limit=10, exit_behavior="error"),
             SummarizationMiddleware(
@@ -91,6 +93,7 @@ def build_agent(
                 permission_policy or PermissionPolicy({t.name: t for t in tools})
             ),
             *(m for m in middleware if isinstance(m, ToolErrorMiddleware)),
+            *execution_middleware,
             ExecutionControlMiddleware(),
         ],
     )

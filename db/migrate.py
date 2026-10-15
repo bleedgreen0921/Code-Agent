@@ -12,7 +12,7 @@ from psycopg.rows import dict_row
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
-VERSION = "core_0002"
+VERSION = "core_0003"
 CORE_TABLES = {"schema_version", "conversations", "runs", "events", "workers"}
 CHECKPOINT_TABLES = {
     "checkpoint_migrations",
@@ -28,15 +28,15 @@ def structure(conn):
     return {
         "columns": conn.execute("""SELECT table_name,column_name,data_type,udt_name,is_nullable,column_default,is_identity
             FROM information_schema.columns WHERE table_schema='agent'
-            AND table_name IN ('schema_version','conversations','runs','events','workers','alembic_version')
+            AND table_name IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources')
             ORDER BY table_name,ordinal_position""").fetchall(),
         "constraints": conn.execute("""SELECT c.relname,con.conname,pg_get_constraintdef(con.oid)
             FROM pg_constraint con JOIN pg_class c ON c.oid=con.conrelid
             JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='agent'
-            AND c.relname IN ('schema_version','conversations','runs','events','workers','alembic_version')
+            AND c.relname IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources')
             ORDER BY 1,2""").fetchall(),
         "indexes": conn.execute("""SELECT tablename,indexname,indexdef FROM pg_indexes WHERE schemaname='agent'
-            AND tablename IN ('schema_version','conversations','runs','events','workers','alembic_version')
+            AND tablename IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources')
             ORDER BY 1,2""").fetchall(),
     }
 
@@ -73,7 +73,7 @@ def validate_database(conn):
     if schemas != {"agent"} or any(
         s != "agent"
         or (
-            t not in CORE_TABLES | CHECKPOINT_TABLES | {"alembic_version"}
+            t not in CORE_TABLES | CHECKPOINT_TABLES | {"alembic_version", "execution_resources"}
             and (t, k) != ("events_id_seq", "S")
         )
         or (t != "events_id_seq" and k != "r")
@@ -94,7 +94,7 @@ def validate_database(conn):
         revisions = conn.execute(
             "SELECT version_num FROM agent.alembic_version"
         ).fetchall()
-        if revisions not in [[("core_0001",)], [("core_0002",)]]:
+        if revisions not in [[("core_0001",)], [("core_0002",)], [("core_0003",)]]:
             raise RuntimeError("Unknown revision rejected without modification")
         revision = revisions[0][0]
     expected = json.loads((ROOT / "structure.json").read_text())[revision]

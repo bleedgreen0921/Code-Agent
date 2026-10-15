@@ -10,6 +10,7 @@ async def inspect():
         return {
             "ready": await resources.store.ready(),
             "workers": await resources.store.workers(),
+            "execution_resources": await resources.store.resource_diagnostics(),
         }
 
 

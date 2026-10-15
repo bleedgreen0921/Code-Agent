@@ -40,6 +40,9 @@ active_model_call = ContextVar("active_model_call", default=None)
 
 
 class ToolLifecycleMiddleware(AgentMiddleware):
+    def __init__(self, output_limits=None):
+        self.output_limits = output_limits
+
     async def awrap_model_call(self, request, handler):
         call = Call(request.runtime, request.runtime.context, "", "model")
         token = active_model_call.set(call)
@@ -81,6 +84,17 @@ class ToolLifecycleMiddleware(AgentMiddleware):
                 raise call.violation
             if call.failure is not None:
                 raise call.failure
+            if self.output_limits and isinstance(result, ToolMessage):
+                from agent_service.output import limit_output
+
+                content, truncated = limit_output(result.text, *self.output_limits)
+                if truncated:
+                    result = result.model_copy(
+                        update={
+                            "content": content,
+                            "artifact": {**(result.artifact or {}), "truncated": True},
+                        }
+                    )
             outcome = getattr(result, "status", type(result).__name__)
             return result
         except BaseException as exc:
@@ -187,7 +201,10 @@ class ToolErrorMiddleware(NativeToolErrorMiddleware):
         )
         from langgraph.errors import GraphBubbleUp
 
+        from agent_service.execution_errors import ExecutionFailure
+
         controls = (
+            ExecutionFailure,
             HookContractError,
             TimeoutError,
             ModelCallLimitExceededError,

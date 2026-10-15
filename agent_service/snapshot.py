@@ -4,6 +4,7 @@ from importlib.metadata import version
 from urllib.parse import urlsplit
 
 from agent_service.profiles import fingerprint, tool_schema
+from agent_service.execution_config import IMPLEMENTATION_VERSION
 
 
 def safe_endpoint(endpoint):
@@ -55,6 +56,18 @@ def runtime_snapshot(model, settings, registry, binding, middleware):
             if profile.id in registry.extensions
             else "1",
         },
+        "execution": (
+            {
+                **registry.execution.model_dump(),
+                "user": registry.execution.effective_user(),
+                "tool_implementation": IMPLEMENTATION_VERSION,
+                "network": "none",
+                "read_only_rootfs": True,
+            }
+            if set(profile.tools)
+            & {"glob_search", "grep_search", "read_file", "edit_file", "shell"}
+            else None
+        ),
         "run_timeout_seconds": settings.run_timeout,
         "framework": {
             name: version(name)

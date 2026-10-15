@@ -154,7 +154,7 @@ def test_current_baseline_upgrade_preserves_history_queue_and_checkpoints(databa
             ).fetchone() == (completed, "chat")
             assert conn.execute(
                 "SELECT version_num FROM agent.alembic_version"
-            ).fetchone() == ("core_0002",)
+            ).fetchone() == ("core_0003",)
             conn.execute("SET search_path TO agent")
             conn.row_factory = dict_row
             assert PostgresSaver(conn).get_tuple(saved).checkpoint["id"] == cp["id"]
@@ -169,3 +169,59 @@ def test_current_baseline_upgrade_preserves_history_queue_and_checkpoints(databa
     finally:
         with psycopg.connect(dsn, autocommit=True) as owner:
             owner.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(name)))
+
+
+def test_core_0002_upgrade_keeps_queued_binding_and_grants_execution_table(database):
+    from alembic.config import Config
+    from alembic import command
+    from pathlib import Path
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import NullPool
+    from agent_service.profiles import DEFAULT_BINDING
+
+    dsn = os.environ["MIGRATION_DATABASE_URL"]
+    name = "agent_test_v2_" + uuid4().hex
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+    prior = make_conninfo(**{**conninfo_to_dict(dsn), "dbname": name})
+    try:
+        engine = create_engine(
+            "postgresql+psycopg://",
+            creator=lambda: psycopg.connect(prior),
+            poolclass=NullPool,
+        )
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("CREATE SCHEMA agent")
+                cfg = Config()
+                cfg.set_main_option(
+                    "script_location", str(Path("db/alembic").resolve())
+                )
+                cfg.attributes["connection"] = conn
+                command.upgrade(cfg, "core_0002")
+        finally:
+            engine.dispose()
+        run_id = uuid4()
+        with psycopg.connect(prior, autocommit=True) as conn:
+            from psycopg.types.json import Jsonb
+
+            conn.execute(
+                """INSERT INTO agent.runs(id,task,idempotency_scope,status,queue_deadline,submitted_binding)
+                VALUES(%s,'kept','standalone','queued',clock_timestamp()+interval '1 hour',%s)""",
+                (run_id, Jsonb(DEFAULT_BINDING)),
+            )
+        with patch.dict(os.environ, {"MIGRATION_DATABASE_URL": prior}):
+            migrate.main()
+            migrate.main()
+        with psycopg.connect(prior) as conn:
+            assert migrate.validate_database(conn) == "core_0003"
+            assert conn.execute(
+                "SELECT status,submitted_binding FROM agent.runs WHERE id=%s", (run_id,)
+            ).fetchone() == ("queued", DEFAULT_BINDING)
+        with psycopg.connect(os.environ["AGENT_DATABASE_URL"]) as conn:
+            assert conn.execute(
+                "SELECT has_table_privilege(current_user,'agent.execution_resources','SELECT,INSERT,UPDATE,DELETE')"
+            ).fetchone()[0]
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(name)))

@@ -1,14 +1,36 @@
-# Optional: export AGENT_RUNTIME_CONFIG=/absolute/path/to/runtime.toml
-# Restart API and Worker together after editing. chat is always built in.
+# export AGENT_RUNTIME_CONFIG=/absolute/path/to/runtime.toml
+# Restart API and Worker together. This configuration never accepts HTTP overrides.
 version = 1
+
+[execution]
+# Run `python -m scripts.build_execution_image`, then copy the immutable ID here.
+# image = "sha256:REPLACE_WITH_64_HEX_DIGITS"
+# Defaults to the non-root Worker's UID:GID. A root Worker must set this explicitly.
+# user = "1000:1000"
+cpus = 1.0
+memory_bytes = 536870912
+pids = 128
+tmp_bytes = 67108864
+command_timeout = 30.0
+cleanup_timeout = 10.0
+output_bytes = 16384
+output_lines = 200
+file_bytes = 10485760
 
 [[workspaces]]
 id = "project"
-# Replace with an existing absolute directory on both API and Worker hosts.
+# Replace with a registered project directory on this Linux host.
 root = "/tmp"
 
+# Built in: chat, workspace_read, workspace_write. Do not redeclare them.
 [[profiles]]
 id = "project-chat"
 system_prompt = "You are a helpful assistant discussing the registered project."
 tools = []
 requires_workspace = true
+
+[[profiles]]
+id = "files-only"
+system_prompt = "Inspect and edit files using workspace-relative paths."
+tools = ["glob_search", "grep_search", "read_file", "edit_file"]
+# Binding a workspace is mandatory whenever any workspace tool is enabled.

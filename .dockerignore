@@ -1,0 +1,6 @@
+*
+!requirements.lock
+!execution/
+!execution/Dockerfile
+!execution/helper.py
+!execution/entrypoint.py

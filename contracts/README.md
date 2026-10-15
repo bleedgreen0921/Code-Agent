@@ -31,3 +31,7 @@
 终态不可取消或覆写；重复取消返回当前状态。取消与成功发布竞争时，由数据库事务先后顺序决定结果；已经进入 cancelling 的任务不可发布成功。执行超时为 `RUN_TIMEOUT`，排队超时为 `QUEUE_TIMEOUT`，失租为 `LEASE_EXPIRED`。Worker 执行前发现提交绑定变化或配置被删除，标记 failed / `CONFIGURATION_CHANGED`，不调用模型。框架限次为 `QUOTA_EXCEEDED`。模型认证、超时、限流和其它 SDK 错误分别为 `MODEL_AUTH_FAILED`、`MODEL_TIMEOUT`、`MODEL_RATE_LIMITED`、`MODEL_CALL_FAILED`，其它执行错误为 `EXECUTION_FAILED`。
 
 错误响应统一为 `{"error":{"code":"...","message":"..."},"request_id":"..."}`，并提供 `X-Request-Id`。HTTP 层不提供 interrupt 审批或 resume 接口。
+
+内置 workspace_read/workspace_write 必须指定已注册 workspace_id。HTTP 不接受宿主路径、镜像、Docker 参数或环境变量。工作区直接修改，取消和失败不回滚。所有工作区工具在无网络 Docker 容器内运行；空工具 chat 不依赖 Docker。
+
+工具超时为 COMMAND_TIMEOUT；环境准备失败为 EXECUTION_ENVIRONMENT_UNAVAILABLE；执行容器或进程异常退出为 EXECUTION_ENVIRONMENT_LOST；正常执行后清理未确认时为 RESOURCE_CLEANUP_FAILED。清理确认前不发布 completed，未释放资源持续占用工作区和执行容量。timeline 包含 environment_preparing、environment_active、environment_closing、environment_cleanup_failed、environment_released、environment_recovered；这些事件不是新的 Run 状态。

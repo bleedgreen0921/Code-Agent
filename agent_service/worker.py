@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import signal
-import time
 from contextlib import suppress
 from uuid import uuid4
 
@@ -15,6 +14,11 @@ from langchain.agents.middleware.tool_call_limit import ToolCallLimitExceededErr
 from langchain_core.messages import AIMessage, HumanMessage
 
 from agent_service.resources import Resources
+from agent_service.execution import ExecutionScope, recover_resources, check_environment
+from agent_service.execution_config import WORKSPACE_TOOLS
+from agent_service.execution_errors import ExecutionFailure, EnvironmentUnavailable
+from agent_service.execution_adapter import WorkspaceExecutionMiddleware
+from agent_service.workspace_tools import assemble
 from agent_service.profiles import ConfigurationChanged, Extension
 from agent_service.snapshot import runtime_snapshot
 from agent_service.runtime import (
@@ -48,13 +52,30 @@ class Worker:
         self.tasks = {}
         self.stopping = asyncio.Event()
 
-    async def prepare(self, row):
+    async def prepare(self, row, scope=None):
         registry = self.resources.registry
         binding = row["submitted_binding"]
         profile = registry.resolve(binding)
-        policy = registry.policy(binding)
+        actual_tools = {name: registry.tools[name] for name in profile.tools}
+        native_middleware = []
+        execution_middleware = []
+        if set(profile.tools) & WORKSPACE_TOOLS:
+            if scope is None:
+                raise RuntimeError(
+                    "Workspace execution requires a Run-owned resource scope"
+                )
+            row["execution_tools"] = profile.tools
+            await scope.prepare()
+            instances, native_middleware = assemble(scope, profile.tools)
+            actual_tools.update({tool.name: tool for tool in instances})
+            execution_middleware = [
+                WorkspaceExecutionMiddleware(
+                    scope, set(profile.tools) & WORKSPACE_TOOLS
+                )
+            ]
+        policy = registry.policy(binding, actual_tools=actual_tools)
         extension = registry.extensions.get(profile.id, Extension())
-        middleware = tuple(extension.middleware_factory())
+        middleware = (*extension.middleware_factory(), *native_middleware)
         snapshot = runtime_snapshot(
             self.model, self.settings, registry, binding, middleware
         )
@@ -72,10 +93,20 @@ class Worker:
             except (psycopg.Error, OSError, TimeoutError):
                 if attempt == 2:
                     raise
+        graph_tools = [
+            t
+            for t in policy.tools.values()
+            if t.name not in {t.name for m in native_middleware for t in m.tools}
+        ]
+        names = [t.name for t in graph_tools] + [
+            t.name for m in middleware for t in getattr(m, "tools", ())
+        ]
+        if len(names) != len(set(names)):
+            raise ValueError("Duplicate runtime tool names")
         graph = build_agent(
             self.model,
             checkpointer=self.resources.checkpointer,
-            tools=list(policy.tools.values()),
+            tools=graph_tools,
             store=self.native_store,
             settings=self.settings,
             system_prompt=profile.system_prompt,
@@ -83,6 +114,13 @@ class Worker:
             state_schema=extension.state_schema,
             response_format=extension.response_format,
             permission_policy=policy,
+            execution_middleware=execution_middleware,
+            output_limits=(
+                registry.execution.output_bytes,
+                registry.execution.output_lines,
+            )
+            if scope
+            else None,
         )
         self.agent = graph
         context = RunContext(
@@ -99,8 +137,8 @@ class Worker:
         )
         return graph, context
 
-    async def generate(self, row):
-        graph, context = await self.prepare(row)
+    async def generate(self, row, scope=None):
+        graph, context = await self.prepare(row, scope)
         messages = []
         if row["previous_run_id"]:
             prior = await self.db.get(row["previous_run_id"])
@@ -117,6 +155,8 @@ class Worker:
             config,
             context=context,
         )
+        if scope:
+            await scope.healthy()
         final = await graph.aget_state(config)
         if final.next or state.get("__interrupt__"):
             raise IncompleteGraphError(
@@ -163,48 +203,85 @@ class Worker:
                 await asyncio.sleep(0.05 * (attempt + 1))
 
     async def execute(self, row):
-        work = asyncio.create_task(self.generate(row))
-        deadline = time.monotonic() + float(row["remaining"])
-        try:
+        scope = (
+            ExecutionScope(self.db, row, self.resources.registry.execution)
+            if await self.db.execution_resource(row["id"])
+            else None
+        )
+        work = asyncio.create_task(self.generate(row, scope))
+        lost = False
+        cancelled = False
+        shutdown = False
+        abort = asyncio.Event()
+        result = {}
+
+        async def renew():
+            nonlocal lost, cancelled
             while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError
-                done, _ = await asyncio.wait(
-                    {work}, timeout=min(self.settings.heartbeat_seconds, remaining)
-                )
-                if work in done:
-                    answer, checkpoint = await work
-                    await self.publish(row, answer=answer, checkpoint=checkpoint)
-                    return
-                status = await self.db.renew(row["id"], row["lease_token"])
-                if status is None:
-                    # Converge expired tasks before returning; never publish after losing ownership.
-                    await self.db.maintain()
-                    return
-                if status == "cancelling":
-                    work.cancel()
-                    await asyncio.gather(work, return_exceptions=True)
-                    await self.publish(row, cancelled=True)
-                    return
-        except asyncio.CancelledError:
-            await self.publish(row, error_code="WORKER_STOPPED")
-            raise
-        except Exception as exc:
-            code = failure_code(exc)
-            log.exception(
-                "run_execution_failed",
-                extra={"run_id": str(row["id"]), "error_code": code},
+                await asyncio.sleep(self.settings.heartbeat_seconds)
+                try:
+                    status = await self.db.renew(row["id"], row["lease_token"])
+                    if status is None:
+                        lost = True
+                        abort.set()
+                        await self.db.maintain()
+                    elif status == "cancelling":
+                        cancelled = True
+                        abort.set()
+                except (psycopg.Error, OSError, TimeoutError):
+                    # Publication still checks lease validity in the database.
+                    log.exception("lease_renewal_unconfirmed")
+
+        heartbeat = asyncio.create_task(renew())
+        interrupt = asyncio.create_task(abort.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {work, interrupt},
+                timeout=float(row["remaining"]),
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            await self.publish(row, error_code=code)
+            if lost or cancelled:
+                pass
+            elif work in done:
+                answer, checkpoint = await work
+                result = {"answer": answer, "checkpoint": checkpoint}
+            else:
+                result = {"error_code": "RUN_TIMEOUT"}
+        except asyncio.CancelledError:
+            shutdown = True
+            result = {"error_code": "WORKER_STOPPED"}
+        except Exception as exc:
+            result = {"error_code": failure_code(exc)}
+            log.exception(
+                "run_execution_failed", extra={"run_id": str(row["id"]), **result}
+            )
         finally:
+            # Freeze admissions before cancelling graph work; executor threads cannot respawn.
+            if scope:
+                with scope.sync_lock:
+                    scope.closing = True
             if not work.done():
                 work.cancel()
             await asyncio.gather(work, return_exceptions=True)
+            try:
+                clean = await scope.close() if scope else True
+                if not clean and not result.get("error_code"):
+                    result = {"error_code": "RESOURCE_CLEANUP_FAILED"}
+                if not lost:
+                    await self.publish(
+                        row, **({"cancelled": True} if cancelled else result)
+                    )
+            finally:
+                heartbeat.cancel()
+                interrupt.cancel()
+                await asyncio.gather(heartbeat, interrupt, return_exceptions=True)
+        if shutdown:
+            raise asyncio.CancelledError
 
     async def tick(self):
         await self.db.heartbeat(self.id)
         await self.db.maintain()
+        await recover_resources(self.db, self.resources.registry.execution)
         for run_id, task in list(self.tasks.items()):
             if task.done():
                 await task
@@ -216,6 +293,13 @@ class Worker:
             self.tasks[row["id"]] = asyncio.create_task(self.execute(row))
 
     async def run(self):
+        if self.resources.registry.execution.image:
+            try:
+                await check_environment(self.resources.registry.execution)
+            except EnvironmentUnavailable:
+                # A broken workspace environment must not prevent empty-tool chat runs.
+                # Workspace runs perform their own fatal preflight before any model call.
+                log.exception("execution_environment_preflight_failed")
         try:
             while not self.stopping.is_set():
                 await self.tick()
@@ -231,6 +315,8 @@ class Worker:
 
 
 def failure_code(exc):
+    if isinstance(exc, ExecutionFailure):
+        return exc.code
     if isinstance(exc, ConfigurationChanged):
         return "CONFIGURATION_CHANGED"
     if isinstance(exc, (ModelCallLimitExceededError, ToolCallLimitExceededError)):
