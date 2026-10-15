@@ -1,0 +1,14 @@
+# Optional: export AGENT_RUNTIME_CONFIG=/absolute/path/to/runtime.toml
+# Restart API and Worker together after editing. chat is always built in.
+version = 1
+
+[[workspaces]]
+id = "project"
+# Replace with an existing absolute directory on both API and Worker hosts.
+root = "/tmp"
+
+[[profiles]]
+id = "project-chat"
+system_prompt = "You are a helpful assistant discussing the registered project."
+tools = []
+requires_workspace = true

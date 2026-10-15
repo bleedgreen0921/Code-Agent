@@ -1,0 +1,50 @@
+# Local documentation and reference material
+/docs/
+
+# Virtual environments and Python caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.cache/
+
+# Generated data, reports and builds
+.data/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+*.log
+
+# Credentials and local configuration
+.env*
+!.env.example
+!.env.sample
+/config/runtime.toml
+/config/*.local.toml
+
+# Archives and backups
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.bak
+*.orig
+*~
+
+# Local editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local experiment output
+/examples/amc_experiments/*
+!/examples/amc_experiments/README.md

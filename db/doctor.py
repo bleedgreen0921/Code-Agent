@@ -1,0 +1,24 @@
+import argparse
+import asyncio
+import json
+
+from agent_service.resources import Resources
+
+
+async def inspect():
+    async with Resources() as resources:
+        return {
+            "ready": await resources.store.ready(),
+            "workers": await resources.store.workers(),
+        }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json", action="store_true")
+    parser.parse_args()
+    print(json.dumps(asyncio.run(inspect()), default=str))
+
+
+if __name__ == "__main__":
+    main()
