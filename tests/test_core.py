@@ -10,7 +10,7 @@ from agent_service.config import Settings
 from agent_service.runtime import run_config
 from agent_service.worker import Worker
 from contracts.errors import ApiError
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, SystemMessage
 
 from tests.models import SyntheticModel
 
@@ -63,7 +63,9 @@ def test_native_postgres_checkpoints_history_and_commit_ack_loss(database, monke
         second, _ = await store.submit("second", conversation_id=conv["id"])
         assert second["previous_run_id"] == first["id"]
         await execute(r, worker)
-        assert [m.text for m in model.history[-1]] == [
+        assert [
+            m.text for m in model.history[-1] if not isinstance(m, SystemMessage)
+        ] == [
             "first",
             "synthetic answer",
             "second",
@@ -81,7 +83,9 @@ def test_native_postgres_checkpoints_history_and_commit_ack_loss(database, monke
         other = await store.create_conversation("isolated")
         await store.submit("alone", conversation_id=other["id"])
         await execute(r, worker)
-        assert [m.text for m in model.history[-1]] == ["alone"]
+        assert [
+            m.text for m in model.history[-1] if not isinstance(m, SystemMessage)
+        ] == ["alone"]
 
     database(check)
 
@@ -122,7 +126,9 @@ def test_failed_cancelled_and_lost_lease_turns_do_not_pollute_history(database):
         assert new["previous_run_id"] == good["id"]
         model = SyntheticModel()
         await execute(r, Worker(r, model=model))
-        assert [m.text for m in model.history[0]] == [
+        assert [
+            m.text for m in model.history[0] if not isinstance(m, SystemMessage)
+        ] == [
             "keep",
             "synthetic answer",
             "next",
@@ -466,7 +472,9 @@ def test_running_cancelled_checkpoint_is_not_inherited(database):
         await r.store.submit("next", conversation_id=conversation["id"])
         model = SyntheticModel()
         await execute(r, Worker(r, model=model))
-        assert [m.text for m in model.history[0]] == [
+        assert [
+            m.text for m in model.history[0] if not isinstance(m, SystemMessage)
+        ] == [
             "successful",
             "synthetic answer",
             "next",

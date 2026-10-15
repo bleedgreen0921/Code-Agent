@@ -332,7 +332,7 @@ def test_prompt_custom_native_state_and_structured_response():
             checkpointer=InMemorySaver(),
         )
         await invoke(graph, "state")
-        assert model.history[0][0].text == "trusted instruction"
+        assert model.history[0][0].text.startswith("trusted instruction")
         assert (await graph.aget_state(run_config("state"))).values["business"] == 1
         from langchain.agents.structured_output import ToolStrategy
 

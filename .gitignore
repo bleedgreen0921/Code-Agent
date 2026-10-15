@@ -1,5 +1,10 @@
 # Local documentation and reference material
-/docs/
+/docs/*
+!/docs/architecture.md
+!/docs/runtime.md
+!/docs/基础架构增强路线图.md
+!/docs/阶段三实施验收.md
+!/docs/阶段一实施验收.md
 
 # Virtual environments and Python caches
 .venv/

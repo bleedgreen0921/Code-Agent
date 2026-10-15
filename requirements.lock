@@ -139,7 +139,9 @@ pydantic-core==2.46.5
 pytest==8.3.5
     # via agent-execution-framework (pyproject.toml)
 pyyaml==6.0.3
-    # via langchain-core
+    # via
+    #   agent-execution-framework (pyproject.toml)
+    #   langchain-core
 regex==2026.9.10
     # via tiktoken
 requests==2.34.2

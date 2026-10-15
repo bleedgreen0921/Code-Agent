@@ -5,6 +5,8 @@ from urllib.parse import urlsplit
 
 from agent_service.profiles import fingerprint, tool_schema
 from agent_service.execution_config import IMPLEMENTATION_VERSION
+from agent_service.context import CONTEXT_VERSION, TODO_LIMITS, SUMMARY_VERSION
+from agent_service.skills import SKILL_VERSION
 
 
 def safe_endpoint(endpoint):
@@ -23,6 +25,13 @@ def runtime_snapshot(model, settings, registry, binding, middleware):
     profile = registry.resolve(binding)
     return {
         "version": 1,
+        "context_policy_version": CONTEXT_VERSION,
+        "todo_limits": TODO_LIMITS if "write_todos" in profile.tools else None,
+        "visible_skills": [
+            registry.skills[n].manifest() for n in sorted(profile.skills)
+        ],
+        "skill_implementation": SKILL_VERSION if profile.skills else None,
+        "summary_prompt_version": SUMMARY_VERSION,
         "binding_fingerprint": binding["fingerprint"],
         "profile": profile.id,
         "profile_fingerprint": binding["profile_fingerprint"],
@@ -45,6 +54,8 @@ def runtime_snapshot(model, settings, registry, binding, middleware):
         "middleware": {
             "model_call_limit": 16,
             "tool_call_limit": 10,
+            "tool_output_bytes": registry.execution.output_bytes,
+            "tool_output_lines": registry.execution.output_lines,
             "max_concurrency": 2,
             "summary_trigger_tokens": settings.summary_trigger_tokens,
             "summary_keep_tokens": settings.summary_keep_tokens,

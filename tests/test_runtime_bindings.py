@@ -113,14 +113,14 @@ def test_input_idempotency_versions_conversation_root_and_trace(database, tmp_pa
             ).status_code == 422
             await client.post(path, json={"task": "first"})
             first = await execute(r, Worker(r, model=model))
-            assert model.history[0][0].text == "changed"
+            assert model.history[0][0].text.startswith("changed")
             install(r, Registry(config(tmp_path, "new prompt")))
             await client.post(
                 path, json={"task": "second"}, headers={"Idempotency-Key": "turn"}
             )
             second = await execute(r, Worker(r, model=model))
             assert second["submitted_binding"] != first["submitted_binding"]
-            assert model.history[-1][0].text == "new prompt"
+            assert model.history[-1][0].text.startswith("new prompt")
             trace = (
                 await client.get("/v1/runs/" + str(second["id"]) + "/trace")
             ).json()

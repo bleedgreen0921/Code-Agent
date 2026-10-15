@@ -7,7 +7,7 @@ dependencies = [
   "psycopg-pool==3.3.3", "httpx==0.28.1",
   "langchain==1.4.2", "langgraph==1.2.12", "langchain-openai==1.6.4",
   "langgraph-checkpoint-postgres==3.1.2",
-  "alembic==1.15.2", "sqlalchemy==2.0.40",
+  "alembic==1.15.2", "sqlalchemy==2.0.40", "PyYAML==6.0.3",
 ]
 
 [project.optional-dependencies]

@@ -59,7 +59,7 @@ curl -X POST http://127.0.0.1:8002/v1/runs \
   -d '{"task":"讨论项目","profile":"project-chat","workspace_id":"project"}'
 ```
 
-配置声明版本、工作区、Profile 和受限的 execution 配置。工具仅能选用启动时的可信注册表，不可通过 TOML 或 HTTP 指定 Python 模块、工具实现、middleware、状态或输出 Schema。未知工具、保留名称冲突、非法根目录导致启动失败。修改配置后按上述停止/重启流程上线；不支持热更新。
+配置声明版本、工作区、Profile、技能目录及受限的 execution 配置。工具仅能选用启动时的可信注册表，不可通过 TOML 或 HTTP 指定 Python 模块、工具实现、middleware、状态或输出 Schema。未知工具、保留名称冲突、非法根目录导致启动失败。修改配置后按上述停止/重启流程上线；不支持热更新。
 
 以下配置均使用 `AGENT_` 前缀，数值为正。时间单位为秒，token 数为框架估算值。
 
@@ -72,7 +72,7 @@ curl -X POST http://127.0.0.1:8002/v1/runs \
 | `AGENT_MAX_ACTIVE_RUNS` | 2 | 全局活动 Run 与未释放执行资源的 Run 上限（去重） |
 | `AGENT_MAX_QUEUED_RUNS` | 8 | 全局排队上限 |
 | `AGENT_MAX_UNFINISHED_RUNS` | 10 | 全局未完成任务上限 |
-| `AGENT_SUMMARY_TRIGGER_TOKENS` | 20000 | 摘要触发阈值 |
+| `AGENT_SUMMARY_TRIGGER_TOKENS` | 20000 | 消息历史摘要触发阈值，非模型上下文窗口硬上限 |
 | `AGENT_SUMMARY_KEEP_TOKENS` | 6000 | 摘要后近期消息保留量 |
 | `AGENT_SUMMARY_TRIM_TOKENS` | 16000 | 摘要输入裁剪上限 |
 | `AGENT_LEASE_SECONDS` | 30 | Run 租约与 Worker 在线判定窗口 |
@@ -143,3 +143,30 @@ Worker 启动与轮询时清理遗留资源，仅处理本项目数据库记录�
 | `RESOURCE_CLEANUP_FAILED` | 执行结束后未确认清理；不发布 completed，保留占用 |
 
 清理默认等待 10 秒。Docker 不可达时恢复同一 daemon 后 Worker 自动重试；daemon ID 不匹配时必须恢复原 daemon。创建结果未知且容器不可见时，不能以一次 inspect 未找到为由释放资源；诊断保留 creating 与 unknown 原因。没有 HTTP 强制解锁入口。请先恢复基础设施并核对数据库记录和 Docker 状态；不要删除占用记录来绕过并发保护。
+
+
+## 复杂任务、技能与上下文
+
+`workspace_read` 和 `workspace_write` 默认启用原生 `write_todos`；复杂任务可按需规划，简单任务直接回答。每次调用替换整张清单，最多 20 项、每项 200 字、序列化 8 KiB，状态为 pending / in_progress / completed。非法或超限输入不更新清单；同一响应中的重复 Todo 更新由原生中间件拒绝。Todo 只反映模型声明的进度，不是验证证据，也不能代替最终回答。新增工具共用每轮主模型 16 次、工具 10 次的额度。
+
+在 TOML 注册 `[skills].directories = ["/absolute/skills"]`，目录的直接子目录使用 `<name>/SKILL.md`：
+
+```markdown
+---
+name: code-review
+description: Review code changes and identify correctness issues.
+---
+Read relevant code, check concrete behavior, and distinguish verified findings from assumptions.
+```
+
+格式遵循 [Agent Skills 规范](https://agentskills.io/specification)。技能必须包含合法且与目录一致的 name、非空 description；UTF-8、普通文件、注册目录内链接、唯一名称及有效输出限制在启动时检查。技能正文必须完整容纳在工具输出限制内（默认 16 KiB、200 行），过长时启动失败并提示缩短正文。每个 Profile 的名称和描述目录最多 8 KiB。可选元数据保留，但 `allowed-tools` 不授予权限；不自动读取项目技能、references/assets/scripts，不执行附带代码。
+
+内置工作区 Profile 可读取全部已注册技能；空目录不暴露 `read_skill`。自定义 Profile 通过 `tools = ["write_todos", "read_skill"]` 和 `skills = ["code-review"]` 显式选择能力，使用 read_skill 时白名单必须非空。只使用这些内存工具的 Profile 无需 Docker。默认 chat 仍为空工具，既有 chat 绑定保持兼容。
+
+API 和 Worker 启动时读取不可变技能快照，修改后须同步重启。技能名称、描述、正文哈希和实现版本参与引用它的 Profile 绑定；排队任务遇到新快照按 `CONFIGURATION_CHANGED` 结束，无关技能修改不会改变未引用它的自定义 Profile。初始请求仅包含名称和描述；`read_skill(name)` 返回当前白名单内的完整正文及名称/哈希 artifact。工具只读内存，不挂载技能目录，也不访问项目文件。历史技能消息不会扩大当前权限，摘要后可再次读取同一快照。
+
+每次主模型调用在扩展 Hook 之后补入可信 Profile 提示、工作区模式、工具范围、无网络、截止时间、失败不回滚、技能目录和当前 Run 的 Todo。尚未规划时明确清单为空。这些上下文仅用于本次请求，不写入消息历史或逐轮积累。日志事件 `model_context` 记录 `history_tokens_approx` 与 `request_tokens_approx`，后者包含系统内容和工具 Schema；估算不是硬配额。摘要仍使用原生模板、分段和重试策略，仅附加代码任务的保留提示，默认触发/保留/输入裁剪分别为 20000/6000/16000 token。
+
+会话唯一继承白名单为 messages：只读取同会话上一成功 Run 发布的明确最终 checkpoint，继承原生摘要和历史工具消息。Todo、计数、业务状态、结构化结果和运行资源每轮重新开始。失败、取消和失租轮次不参与继承。本阶段没有新增表、迁移、详情字段、端点或流式协议。
+
+现有 `/v1/runs/{run_id}/trace` 和 `python -m db.trace_run RUN_UUID` 可查看原生 checkpoint 的 `channel_values.todos` 与工具消息，按配置中的最终 checkpoint_id 定位成功结果。`runtime_config` 记录上下文策略版本、Todo 限制、可见技能及哈希、摘要提示版本；技能正文只进入工具消息，不复制到配置快照。架构与扩展规则见 [架构说明](docs/architecture.md) 和 [运行说明](docs/runtime.md)，本阶段验证见 [阶段三验收](docs/阶段三实施验收.md)。

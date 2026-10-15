@@ -19,6 +19,19 @@ from agent_service.execution_config import (
     IMPLEMENTATION_VERSION,
 )
 from agent_service.workspace_tools import builtin_tools
+from agent_service.skills import (
+    load_skills,
+    read_skill_tool,
+    catalog,
+    SKILL_VERSION,
+    CATALOG_BYTES,
+)
+from agent_service.context import (
+    validate_todos,
+    TODO_LIMITS,
+    TODO_VERSION,
+    CONTEXT_VERSION,
+)
 
 
 def fingerprint(value):
@@ -48,6 +61,11 @@ class Profile(Declaration):
     system_prompt: str | None = None
     tools: tuple[str, ...] = ()
     requires_workspace: bool = False
+    skills: tuple[str, ...] = ()
+
+
+class SkillsConfig(Declaration):
+    directories: tuple[str, ...] = ()
 
 
 class RuntimeFile(Declaration):
@@ -55,6 +73,7 @@ class RuntimeFile(Declaration):
     workspaces: list[Workspace] = []
     profiles: list[Profile] = []
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
 
 
 @dataclass(frozen=True)
@@ -84,26 +103,61 @@ class PermissionPolicy:
 
 class Registry:
     def __init__(self, config=None, *, tools=(), validators=None, extensions=None):
-        tools = (*builtin_tools(), *tools)
+        from langchain.agents.middleware import TodoListMiddleware
+
+        config = config or RuntimeFile(version=1)
+        self.skills = load_skills(
+            config.skills.directories,
+            config.execution.output_bytes,
+            config.execution.output_lines,
+        )
+        tools = (
+            *builtin_tools(),
+            *TodoListMiddleware().tools,
+            read_skill_tool({}),
+            *tools,
+        )
         self.tools = MappingProxyType({t.name: t for t in tools})
         if len(self.tools) != len(tools):
             raise ValueError("Duplicate tool names")
-        self.validators = MappingProxyType(dict(validators or {}))
+        custom_validators = dict(validators or {})
+        extra_todo_validator = custom_validators.get("write_todos")
+        custom_validators["write_todos"] = lambda args, ctx: validate_todos(
+            args, ctx
+        ) and (
+            extra_todo_validator is None or extra_todo_validator(args, ctx) is not False
+        )
+        self.validators = MappingProxyType(custom_validators)
         self.extensions = MappingProxyType(dict(extensions or {}))
         if "chat" in self.extensions:
             raise ValueError("chat is reserved")
-        config = config or RuntimeFile(version=1)
         self.execution = config.execution
         profiles = {
             "chat": Profile(id="chat"),
             "workspace_read": Profile(
                 id="workspace_read",
-                tools=("glob_search", "grep_search", "read_file"),
+                tools=(
+                    "glob_search",
+                    "grep_search",
+                    "read_file",
+                    "write_todos",
+                    *(("read_skill",) if self.skills else ()),
+                ),
+                skills=tuple(sorted(self.skills)),
                 requires_workspace=True,
             ),
             "workspace_write": Profile(
                 id="workspace_write",
-                tools=("glob_search", "grep_search", "read_file", "edit_file", "shell"),
+                tools=(
+                    "glob_search",
+                    "grep_search",
+                    "read_file",
+                    "edit_file",
+                    "shell",
+                    "write_todos",
+                    *(("read_skill",) if self.skills else ()),
+                ),
+                skills=tuple(sorted(self.skills)),
                 requires_workspace=True,
             ),
         }
@@ -131,6 +185,21 @@ class Registry:
             or self.validators.keys() - self.tools.keys()
         ):
             raise ValueError("Unknown extension profile or validator tool")
+        for profile in profiles.values():
+            if (
+                len(profile.skills) != len(set(profile.skills))
+                or set(profile.skills) - self.skills.keys()
+            ):
+                raise ValueError("Unknown or duplicate profile skills")
+            if ("read_skill" in profile.tools) != bool(profile.skills):
+                raise ValueError(
+                    "read_skill requires an explicit nonempty skills allowlist"
+                )
+            if (
+                len(catalog([self.skills[n] for n in sorted(profile.skills)]).encode())
+                > CATALOG_BYTES
+            ):
+                raise ValueError("Profile skill catalog exceeds 8 KiB")
         self.profiles = MappingProxyType(profiles)
         self.workspaces = MappingProxyType(workspaces)
 
@@ -143,8 +212,11 @@ class Registry:
             raw = tomllib.load(file)
         # TOML arrays are lists; the immutable profile stores tool names as tuples.
         for profile in raw.get("profiles", []):
-            if "tools" in profile and isinstance(profile["tools"], list):
-                profile["tools"] = tuple(profile["tools"])
+            for key in ("tools", "skills"):
+                if isinstance(profile.get(key), list):
+                    profile[key] = tuple(profile[key])
+        if isinstance(raw.get("skills", {}).get("directories"), list):
+            raw["skills"]["directories"] = tuple(raw["skills"]["directories"])
         return cls(RuntimeFile.model_validate(raw), **trusted)
 
     def bind(self, profile="chat", workspace_id=None):
@@ -167,7 +239,37 @@ class Registry:
             "profile": profile,
             "profile_fingerprint": fingerprint(
                 {
-                    **declaration.model_dump(),
+                    **declaration.model_dump(exclude={"skills"}),
+                    **(
+                        {
+                            "todo": {"version": TODO_VERSION, "limits": TODO_LIMITS},
+                            "context_policy": CONTEXT_VERSION,
+                        }
+                        if "write_todos" in declaration.tools
+                        else {}
+                    ),
+                    **(
+                        {
+                            "skills": [
+                                self.skills[n].manifest()
+                                for n in sorted(declaration.skills)
+                            ],
+                            "skill_implementation": SKILL_VERSION,
+                            "context_policy": CONTEXT_VERSION,
+                        }
+                        if declaration.skills
+                        else {}
+                    ),
+                    **(
+                        {
+                            "tool_output_limits": {
+                                "bytes": self.execution.output_bytes,
+                                "lines": self.execution.output_lines,
+                            }
+                        }
+                        if set(declaration.tools) & {"write_todos", "read_skill"}
+                        else {}
+                    ),
                     "tools": sorted(declaration.tools),
                     "extension_version": self.extensions.get(
                         profile, Extension()

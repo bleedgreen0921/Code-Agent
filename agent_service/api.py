@@ -3,7 +3,7 @@ from uuid import UUID
 
 from contracts.v1 import ConversationCreate, RunCreate, RunStatus, TurnCreate
 from fastapi import APIRouter, Header, Query, Request, Response
-from fastapi.encoders import jsonable_encoder
+from agent_service.trace import encode_trace
 
 from agent_service.runtime import run_config
 from agent_service.storage import public_run
@@ -93,7 +93,7 @@ async def trace(run_id: UUID, request: Request, limit: int = Query(50, ge=1, le=
                 "pending_writes": cp.pending_writes,
             }
         )
-    return jsonable_encoder(
+    return encode_trace(
         {
             "run_id": str(run_id),
             "status": row["status"],

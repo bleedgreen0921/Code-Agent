@@ -34,3 +34,17 @@ id = "files-only"
 system_prompt = "Inspect and edit files using workspace-relative paths."
 tools = ["glob_search", "grep_search", "read_file", "edit_file"]
 # Binding a workspace is mandatory whenever any workspace tool is enabled.
+
+# Skills are server-side startup snapshots. Each direct child is <name>/SKILL.md.
+# Use existing absolute directories; restart API and Worker together after edits.
+[skills]
+directories = []
+# directories = ["/srv/agent/skills"]
+
+# Built-in workspace profiles enable write_todos and all registered skills.
+# Custom profiles explicitly select tools and list allowed skill names.
+# This profile only uses in-memory tools, so it requires no Docker or workspace.
+# [[profiles]]
+# id = "review-planner"
+# tools = ["write_todos", "read_skill"]
+# skills = ["code-review"]

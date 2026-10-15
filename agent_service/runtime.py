@@ -17,6 +17,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.store.base import BaseStore
 
 from agent_service.config import Settings
+from agent_service.context import RunContextMiddleware, SUMMARY_PROMPT, validate_todos
 from agent_service.profiles import PermissionPolicy
 from agent_service.policy import (
     PermissionMiddleware,
@@ -67,8 +68,28 @@ def build_agent(
     permission_policy: PermissionPolicy | None = None,
     execution_middleware=(),
     output_limits=None,
+    skills=(),
 ):
     cfg = settings or Settings.from_env()
+    supplied = [
+        *tools,
+        *(
+            t
+            for m in (*middleware, *execution_middleware)
+            for t in getattr(m, "tools", ())
+        ),
+    ]
+    names = [t.name for t in supplied]
+    if len(names) != len(set(names)):
+        raise ValueError("Duplicate runtime tool names")
+    policy = permission_policy or PermissionPolicy({t.name: t for t in supplied})
+    validators = dict(policy.validators)
+    if "write_todos" in policy.tools:
+        custom = validators.get("write_todos")
+        validators["write_todos"] = lambda args, ctx: validate_todos(args, ctx) and (
+            custom is None or custom(args, ctx) is not False
+        )
+    policy = PermissionPolicy(policy.tools, validators, policy.binding_fingerprint)
     return create_agent(
         model=model,
         tools=list(tools),
@@ -79,7 +100,7 @@ def build_agent(
         state_schema=state_schema,
         response_format=response_format,
         middleware=[
-            ToolLifecycleMiddleware(output_limits),
+            ToolLifecycleMiddleware(output_limits or (16384, 200)),
             ModelCallLimitMiddleware(run_limit=16, exit_behavior="error"),
             ToolCallLimitMiddleware(run_limit=10, exit_behavior="error"),
             SummarizationMiddleware(
@@ -87,13 +108,13 @@ def build_agent(
                 trigger=("tokens", cfg.summary_trigger_tokens),
                 keep=("tokens", cfg.summary_keep_tokens),
                 trim_tokens_to_summarize=cfg.summary_trim_tokens,
+                summary_prompt=SUMMARY_PROMPT,
             ),
             *(m for m in middleware if not isinstance(m, ToolErrorMiddleware)),
-            PermissionMiddleware(
-                permission_policy or PermissionPolicy({t.name: t for t in tools})
-            ),
+            PermissionMiddleware(policy),
             *(m for m in middleware if isinstance(m, ToolErrorMiddleware)),
             *execution_middleware,
+            RunContextMiddleware(policy, system_prompt=system_prompt, skills=skills),
             ExecutionControlMiddleware(),
         ],
     )

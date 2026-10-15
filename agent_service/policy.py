@@ -5,7 +5,8 @@ import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from langgraph.types import Command
 
 from langchain.agents.middleware import (
     AgentMiddleware,
@@ -42,6 +43,38 @@ active_model_call = ContextVar("active_model_call", default=None)
 class ToolLifecycleMiddleware(AgentMiddleware):
     def __init__(self, output_limits=None):
         self.output_limits = output_limits
+
+    def limit_result(self, result):
+        from agent_service.output import limit_output
+
+        if isinstance(result, ToolMessage):
+            content, truncated = limit_output(result.text, *self.output_limits)
+            if truncated:
+                # Arbitrary artifacts are part of the native tool protocol; preserve them.
+                artifact = (
+                    {**result.artifact, "truncated": True}
+                    if isinstance(result.artifact, dict)
+                    else result.artifact
+                )
+                result = result.model_copy(
+                    update={"content": content, "artifact": artifact}
+                )
+        elif isinstance(result, Command) and isinstance(result.update, dict):
+            messages = result.update.get("messages")
+            if isinstance(messages, ToolMessage):
+                result = replace(
+                    result,
+                    update={**result.update, "messages": self.limit_result(messages)},
+                )
+            elif isinstance(messages, (list, tuple)):
+                result = replace(
+                    result,
+                    update={
+                        **result.update,
+                        "messages": [self.limit_result(m) for m in messages],
+                    },
+                )
+        return result
 
     async def awrap_model_call(self, request, handler):
         call = Call(request.runtime, request.runtime.context, "", "model")
@@ -84,17 +117,8 @@ class ToolLifecycleMiddleware(AgentMiddleware):
                 raise call.violation
             if call.failure is not None:
                 raise call.failure
-            if self.output_limits and isinstance(result, ToolMessage):
-                from agent_service.output import limit_output
-
-                content, truncated = limit_output(result.text, *self.output_limits)
-                if truncated:
-                    result = result.model_copy(
-                        update={
-                            "content": content,
-                            "artifact": {**(result.artifact or {}), "truncated": True},
-                        }
-                    )
+            if self.output_limits:
+                result = self.limit_result(result)
             outcome = getattr(result, "status", type(result).__name__)
             return result
         except BaseException as exc:

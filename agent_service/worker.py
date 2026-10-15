@@ -19,7 +19,10 @@ from agent_service.execution_config import WORKSPACE_TOOLS
 from agent_service.execution_errors import ExecutionFailure, EnvironmentUnavailable
 from agent_service.execution_adapter import WorkspaceExecutionMiddleware
 from agent_service.workspace_tools import assemble
-from agent_service.profiles import ConfigurationChanged, Extension
+from agent_service.profiles import ConfigurationChanged, Extension, tool_schema
+from agent_service.context import inherited_state
+from agent_service.skills import read_skill_tool
+from langchain.agents.middleware import TodoListMiddleware
 from agent_service.snapshot import runtime_snapshot
 from agent_service.runtime import (
     RunContext,
@@ -73,9 +76,24 @@ class Worker:
                     scope, set(profile.tools) & WORKSPACE_TOOLS
                 )
             ]
-        policy = registry.policy(binding, actual_tools=actual_tools)
         extension = registry.extensions.get(profile.id, Extension())
+        if "write_todos" in profile.tools:
+            native_middleware.append(TodoListMiddleware())
+        if "read_skill" in profile.tools:
+            actual_tools["read_skill"] = read_skill_tool(
+                {n: registry.skills[n] for n in profile.skills}
+            )
         middleware = (*extension.middleware_factory(), *native_middleware)
+        generated = [t for m in middleware for t in getattr(m, "tools", ())]
+        names = [t.name for t in generated]
+        if len(names) != len(set(names)) or set(names) - set(profile.tools):
+            raise ValueError("Duplicate or undeclared middleware tools")
+        if any(
+            tool_schema(t) != tool_schema(registry.tools[t.name]) for t in generated
+        ):
+            raise ValueError("Middleware tool schema differs from its declaration")
+        actual_tools.update({t.name: t for t in generated})
+        policy = registry.policy(binding, actual_tools=actual_tools)
         snapshot = runtime_snapshot(
             self.model, self.settings, registry, binding, middleware
         )
@@ -96,7 +114,7 @@ class Worker:
         graph_tools = [
             t
             for t in policy.tools.values()
-            if t.name not in {t.name for m in native_middleware for t in m.tools}
+            if t.name not in {t.name for t in generated}
         ]
         names = [t.name for t in graph_tools] + [
             t.name for m in middleware for t in getattr(m, "tools", ())
@@ -118,9 +136,8 @@ class Worker:
             output_limits=(
                 registry.execution.output_bytes,
                 registry.execution.output_lines,
-            )
-            if scope
-            else None,
+            ),
+            skills=[registry.skills[n] for n in sorted(profile.skills)],
         )
         self.agent = graph
         context = RunContext(
@@ -142,13 +159,23 @@ class Worker:
         messages = []
         if row["previous_run_id"]:
             prior = await self.db.get(row["previous_run_id"])
-            if prior["status"] != "completed" or not prior["final_checkpoint"]:
+            if (
+                prior["status"] != "completed"
+                or not prior["final_checkpoint"]
+                or not prior["final_checkpoint"]
+                .get("configurable", {})
+                .get("checkpoint_id")
+                or prior["conversation_id"] != row["conversation_id"]
+                or row["conversation_id"] is None
+                or prior["final_checkpoint"].get("configurable", {}).get("thread_id")
+                != str(prior["id"])
+            ):
                 raise RuntimeError("Successful predecessor checkpoint required")
             # Read the exact published checkpoint, never the latest intermediate state.
             snapshot = await graph.aget_state(prior["final_checkpoint"])
             if snapshot.next or not snapshot.values.get("messages"):
                 raise RuntimeError("Predecessor final checkpoint unavailable")
-            messages = list(snapshot.values["messages"])
+            messages = inherited_state(snapshot.values)["messages"]
         config = run_config(row["id"])
         state = await graph.ainvoke(
             {"messages": [*messages, HumanMessage(content=row["task"])]},
@@ -352,7 +379,13 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
-        for key in ("run_id", "status", "error_code"):
+        for key in (
+            "run_id",
+            "status",
+            "error_code",
+            "history_tokens_approx",
+            "request_tokens_approx",
+        ):
             if hasattr(record, key):
                 payload[key] = getattr(record, key)
         if record.exc_info:

@@ -5,7 +5,7 @@ from uuid import UUID
 
 from agent_service.resources import Resources
 from agent_service.runtime import run_config
-from fastapi.encoders import jsonable_encoder
+from agent_service.trace import encode_trace
 
 
 async def inspect(run_id):
@@ -35,9 +35,7 @@ def main():
     parser.add_argument("run_id", type=UUID)
     args = parser.parse_args()
     print(
-        json.dumps(
-            jsonable_encoder(asyncio.run(inspect(args.run_id))), ensure_ascii=False
-        )
+        json.dumps(encode_trace(asyncio.run(inspect(args.run_id))), ensure_ascii=False)
     )
 
 
