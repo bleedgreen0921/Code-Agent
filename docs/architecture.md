@@ -35,3 +35,6 @@ RunContextMiddleware 在每次主模型调用前重建可信运行约束、技�
 ## 阶段五补充
 
 项目知识使用限定工作区的原生 PostgreSQL Store 只读视图；人工管理 API 以 ETag 和事务级锁完成创建、更新及删除。MCP 采用静态 HTTP 服务、冻结目录、Profile 白名单与每 Run 独立原生 MCPAdapter；外部写入先确认派发记录，未知结果不重发。core_0004 新增 external_operations，trace/timeline/doctor 提供关联核对。详细契约、配置、部署和故障处理见 [项目知识与外部工具](项目知识与外部工具.md)。
+
+
+持久 Task、后台 Docker/MCP Tasks、跨 Run 结果衔接与独立监控租约见 [持久任务与后台操作](持久任务与后台操作.md)。core_0005 扩展现有事务与工作区冲突检查，不引入外部队列或 Workflow 引擎。

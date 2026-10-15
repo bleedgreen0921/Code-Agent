@@ -23,13 +23,35 @@ def database():
         )
     with psycopg.connect(os.environ["MIGRATION_DATABASE_URL"], autocommit=True) as conn:
         conn.execute(
-            "TRUNCATE agent.conversations,agent.runs,agent.events,agent.workers,agent.checkpoints,agent.checkpoint_blobs,agent.checkpoint_writes CASCADE"
+            "TRUNCATE agent.tasks,agent.task_dependencies,agent.background_operations,agent.task_events,agent.conversations,agent.runs,agent.events,agent.workers,agent.checkpoints,agent.checkpoint_blobs,agent.checkpoint_writes CASCADE"
         )
 
     def run(fn, settings=None):
         async def scoped():
             async with Resources(settings or Settings()) as resources:
-                return await fn(resources)
+                try:
+                    return await fn(resources)
+                finally:
+                    # Test-owned background containers must be removed even on assertion
+                    # failure, before the next test truncates their ownership journal.
+                    from agent_service.execution import DockerClient, LABEL
+
+                    client = DockerClient()
+                    for op in await resources.store.operations(raw=True):
+                        if op["backend"] != "docker":
+                            continue
+                        item = await client.inspect(
+                            op["container_id"] or op["container_name"]
+                        )
+                        if item:
+                            assert (
+                                item["Config"]["Labels"].get(LABEL)
+                                == op["container_name"]
+                            )
+                            assert item["Config"]["Labels"].get(
+                                "io.agent-framework.operation"
+                            ) == str(op["id"])
+                            await client.call("rm", "--force", item["Id"])
 
         return asyncio.run(scoped())
 

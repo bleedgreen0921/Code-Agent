@@ -40,3 +40,5 @@
 ## 阶段五补充
 
 项目知识使用限定工作区的原生 PostgreSQL Store 只读视图；人工管理 API 以 ETag 和事务级锁完成创建、更新及删除。MCP 采用静态 HTTP 服务、冻结目录、Profile 白名单与每 Run 独立原生 MCPAdapter；外部写入先确认派发记录，未知结果不重发。core_0004 新增 external_operations，trace/timeline/doctor 提供关联核对。详细契约、配置、部署和故障处理见 [项目知识与外部工具](../docs/项目知识与外部工具.md)。
+
+持久 Task 契约：`TaskCreate(task, profile, workspace_id, depends_on)`；依赖最多八个唯一 UUID。Task API、状态与操作结果见 [持久任务与后台操作](../docs/持久任务与后台操作.md)。Run 列表支持 task_id，详情和 trace 包含 task_id / execution_no；取消 Task 所属 Run 同时取消 Task。

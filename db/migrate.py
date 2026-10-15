@@ -13,7 +13,7 @@ from psycopg.rows import dict_row
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
-VERSION = "core_0004"
+VERSION = "core_0005"
 STORE_TABLES = {"store", "store_migrations"}
 CORE_TABLES = {"schema_version", "conversations", "runs", "events", "workers"}
 CHECKPOINT_TABLES = {
@@ -25,22 +25,16 @@ CHECKPOINT_TABLES = {
 ROOT = Path(__file__).parent
 
 
+CORE_QUERIES = {
+    "columns": "SELECT table_name,column_name,data_type,udt_name,is_nullable,column_default,is_identity\n            FROM information_schema.columns WHERE table_schema='agent'\n            AND table_name IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources','external_operations','tasks','task_dependencies','background_operations','task_events')\n            ORDER BY table_name,ordinal_position",
+    "constraints": "SELECT c.relname,con.conname,pg_get_constraintdef(con.oid)\n            FROM pg_constraint con JOIN pg_class c ON c.oid=con.conrelid\n            JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='agent'\n            AND c.relname IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources','external_operations','tasks','task_dependencies','background_operations','task_events')\n            ORDER BY 1,2",
+    "indexes": "SELECT tablename,indexname,indexdef FROM pg_indexes WHERE schemaname='agent'\n            AND tablename IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources','external_operations','tasks','task_dependencies','background_operations','task_events')\n            ORDER BY 1,2",
+}
+
+
 def structure(conn):
-    """Stable structural signature, independent of OIDs, rows, owner and checkpoints."""
-    return {
-        "columns": conn.execute("""SELECT table_name,column_name,data_type,udt_name,is_nullable,column_default,is_identity
-            FROM information_schema.columns WHERE table_schema='agent'
-            AND table_name IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources','external_operations')
-            ORDER BY table_name,ordinal_position""").fetchall(),
-        "constraints": conn.execute("""SELECT c.relname,con.conname,pg_get_constraintdef(con.oid)
-            FROM pg_constraint con JOIN pg_class c ON c.oid=con.conrelid
-            JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='agent'
-            AND c.relname IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources','external_operations')
-            ORDER BY 1,2""").fetchall(),
-        "indexes": conn.execute("""SELECT tablename,indexname,indexdef FROM pg_indexes WHERE schemaname='agent'
-            AND tablename IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources','external_operations')
-            ORDER BY 1,2""").fetchall(),
-    }
+    """Stable structural signature independent of rows, owners and checkpoints."""
+    return {key: conn.execute(query).fetchall() for key, query in CORE_QUERIES.items()}
 
 
 def validate_database(conn):
@@ -79,10 +73,18 @@ def validate_database(conn):
             not in CORE_TABLES
             | CHECKPOINT_TABLES
             | STORE_TABLES
-            | {"alembic_version", "execution_resources", "external_operations"}
-            and (t, k) != ("events_id_seq", "S")
+            | {
+                "alembic_version",
+                "execution_resources",
+                "external_operations",
+                "tasks",
+                "task_dependencies",
+                "background_operations",
+                "task_events",
+            }
+            and (t, k) not in (("events_id_seq", "S"), ("task_events_id_seq", "S"))
         )
-        or (t != "events_id_seq" and k != "r")
+        or (t not in ("events_id_seq", "task_events_id_seq") and k != "r")
         for s, t, k in rows
     ):
         raise RuntimeError(
@@ -105,6 +107,7 @@ def validate_database(conn):
             [("core_0002",)],
             [("core_0003",)],
             [("core_0004",)],
+            [("core_0005",)],
         ]:
             raise RuntimeError("Unknown revision rejected without modification")
         revision = revisions[0][0]

@@ -16,7 +16,7 @@ export AGENT_DATABASE_URL='postgresql://agent_runtime:RUNTIME_PASSWORD@127.0.0.1
 .venv/bin/python -m db.doctor --json
 ```
 
-请预先创建空数据库。迁移 owner 需要创建表；bootstrap 还需要创建运行角色的权限。运行角色必须与 owner 分离，无 schema、数据库创建权或 revision 写权限。迁移通过单条 Alembic 链 `core_0001 → core_0002 → core_0003 → core_0004` 创建/升级核心表，版本权威为 `agent.alembic_version`，并调用框架 Checkpointer 和 PostgreSQL Store 的 `setup()`；重复执行安全，API/Worker 不执行 DDL。
+请预先创建空数据库。迁移 owner 需要创建表；bootstrap 还需要创建运行角色的权限。运行角色必须与 owner 分离，无 schema、数据库创建权或 revision 写权限。迁移通过单条 Alembic 链 `core_0001 → core_0002 → core_0003 → core_0004 → core_0005` 创建/升级核心表，版本权威为 `agent.alembic_version`，并调用框架 Checkpointer 和 PostgreSQL Store 的 `setup()`；重复执行安全，API/Worker 不执行 DDL。
 
 迁移接受空库、结构匹配的当前 `agent_core_0001` 核心库及已知 Alembic revision。旧核心库先经只读结构/标识校验，再登记 core_0001 并升级；历史会话与 Run 回填 chat 绑定，历史模型配置保持 null。旧业务 schema、未知 revision、未知非空库、结构不匹配库在任何 DDL 和权限修改前拒绝。checkpoint 表继续由框架维护。
 
@@ -203,3 +203,10 @@ curl 'http://127.0.0.1:8000/v1/runs/RUN_UUID/trace?namespace='
 静态 `[mcp]` 声明 HTTP 服务、本地 tools/list 目录、凭据环境变量引用和 read/write 分类，Profile.tools 显式选择稳定别名；三个内置 Profile 不自动获得 MCP。Worker 使用原生 MCPAdapter，每 Run 独立连接和契约核验；写调用独占批次、先记录派发，未知结果终止 Run，不重发请求。知识或 MCP 单独使用均无需 Docker，已有工作区容器继续无网络。
 
 部署须升级 core_0004 并重新 bootstrap，API/Worker 不执行 DDL。配置、完整 API、目录导出、凭据配置和外部结果核对见 [项目知识与外部工具](docs/项目知识与外部工具.md)，验收证据见 [阶段五验收](docs/阶段五实施验收.md)。
+
+
+## 持久任务与后台操作
+
+`POST /v1/tasks` 创建独立 Task，固定目标、Profile、工作区与前置依赖。后台命令和原生 MCP Tasks 立即启动，等待结果时释放 Run 槽；Worker 重启核对已有资源，结果到达后创建唯一续 Run。当前 Task 在本地后台执行期间可读取和只读委派，文件可能变化；写入和普通 Shell 被禁止。未知结果失败且不自动重试，外部副作用无法撤回。
+
+部署升级 core_0005、重新 bootstrap 并构建新执行镜像。显式选择配置示例的 task-workspace Profile；内置 Profile 不增加后台工具。API、默认限额、状态和故障核对见 [持久任务与后台操作](docs/持久任务与后台操作.md)。

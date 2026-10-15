@@ -11,6 +11,7 @@ async def inspect():
             "ready": await resources.store.ready(),
             "workers": await resources.store.workers(),
             "execution_resources": await resources.store.resource_diagnostics(),
+            "background_operations": await resources.store.operations(),
             "external_operations": await resources.store.external_operations(),
         }
 

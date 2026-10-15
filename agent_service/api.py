@@ -1,7 +1,14 @@
 from datetime import datetime
 from uuid import UUID
 
-from contracts.v1 import ConversationCreate, RunCreate, RunStatus, TurnCreate
+from contracts.v1 import (
+    ConversationCreate,
+    RunCreate,
+    RunStatus,
+    TurnCreate,
+    TaskCreate,
+    TaskStatus,
+)
 from fastapi import APIRouter, Header, Query, Request, Response
 from agent_service.trace import encode_trace, trace_config
 
@@ -40,6 +47,7 @@ async def submit(
 async def runs(
     request: Request,
     status: RunStatus | None = None,
+    task_id: UUID | None = None,
     created_after: datetime | None = None,
     created_before: datetime | None = None,
     limit: int = Query(30, ge=1, le=100),
@@ -47,6 +55,7 @@ async def runs(
 ):
     return await db(request).runs(
         status=status,
+        task_id=task_id,
         created_after=created_after,
         created_before=created_before,
         limit=limit,
@@ -100,6 +109,8 @@ async def trace(
     return encode_trace(
         {
             "run_id": str(run_id),
+            "task_id": row["task_id"],
+            "execution_no": row["execution_no"],
             "status": row["status"],
             "submitted_binding": row["submitted_binding"],
             "runtime_config": row["runtime_config"],
@@ -162,3 +173,68 @@ async def cancel_turn(
     row = await db(request).cancel(turn_id, conversation_id)
     response.status_code = 202 if row["status"] == "cancelling" else 200
     return accepted(row)
+
+
+@router.post("/tasks")
+async def create_task(
+    body: TaskCreate,
+    request: Request,
+    response: Response,
+    key: str | None = Header(None, alias="Idempotency-Key"),
+):
+    row, replay = await db(request).create_task(
+        body.task,
+        key,
+        profile=body.profile,
+        workspace_id=body.workspace_id,
+        depends_on=body.depends_on,
+    )
+    response.status_code = 200 if replay else 202
+    return row
+
+
+@router.get("/tasks")
+async def tasks(
+    request: Request,
+    status: TaskStatus | None = None,
+    limit: int = Query(30, ge=1, le=100),
+    cursor: UUID | None = None,
+):
+    return await db(request).list_tasks(limit, cursor, status)
+
+
+@router.get("/tasks/{task_id}")
+async def task(task_id: UUID, request: Request):
+    return await db(request).task(task_id)
+
+
+@router.post("/tasks/{task_id}/cancel")
+async def cancel_task(task_id: UUID, request: Request, response: Response):
+    row = await db(request).cancel_task(task_id)
+    response.status_code = 202 if row["status"] == "cancelling" else 200
+    return row
+
+
+@router.get("/tasks/{task_id}/timeline")
+async def task_timeline(task_id: UUID, request: Request):
+    return await db(request).task_timeline(task_id)
+
+
+@router.get("/tasks/{task_id}/operations")
+async def task_operations(task_id: UUID, request: Request):
+    await db(request).task(task_id)
+    return {"items": await db(request).operations(task_id)}
+
+
+@router.get("/tasks/{task_id}/operations/{operation_id}")
+async def operation(task_id: UUID, operation_id: UUID, request: Request):
+    return await db(request).operation(task_id, operation_id)
+
+
+@router.post("/tasks/{task_id}/operations/{operation_id}/cancel")
+async def cancel_operation(
+    task_id: UUID, operation_id: UUID, request: Request, response: Response
+):
+    row = await db(request).cancel_operation(task_id, operation_id)
+    response.status_code = 202 if row["state"] == "cancelling" else 200
+    return row

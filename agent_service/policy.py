@@ -137,6 +137,15 @@ class ToolLifecycleMiddleware(AgentMiddleware):
                 raise call.failure
             if self.output_limits:
                 result = self.limit_result(result)
+            candidates = getattr(call.context, "result_delivery", None)
+            if candidates is not None and call.call_id in candidates:
+                operation_id, expected = candidates.pop(call.call_id)
+                if (
+                    isinstance(result, ToolMessage)
+                    and result.status == "success"
+                    and result.content == expected
+                ):
+                    call.context.delivered_results.add(operation_id)
             outcome = getattr(result, "status", type(result).__name__)
             return result
         except BaseException as exc:

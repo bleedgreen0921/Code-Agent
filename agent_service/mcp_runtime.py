@@ -142,7 +142,7 @@ class RestrictedClient(Client):
         )
 
 
-def make_client(server, settings, output_limits):
+def make_client(server, settings, output_limits, *, background=False):
     headers = {key: os.environ[value] for key, value in server.headers_env.items()}
     if server.bearer_env:
         headers["Authorization"] = "Bearer " + os.environ[server.bearer_env]
@@ -151,13 +151,18 @@ def make_client(server, settings, output_limits):
     transport = StreamableHttpTransport(
         server.url, headers=headers, httpx_client_factory=http_client_factory
     )
-    client = RestrictedClient(
+    extensions = []
+    if background:
+        from fastmcp_tasks.client import TasksClientExtension
+
+        extensions = [TasksClientExtension()]
+    client = (TaskClient if background else RestrictedClient)(
         transport,
         timeout=settings.call_timeout,
         init_timeout=settings.init_timeout,
         cache=False,
-        extensions=[],
-        mode="legacy",
+        extensions=extensions,
+        mode="auto" if background else "legacy",
         elicitation_handler=reject_elicitation,
         log_handler=ignore_remote_event,
         progress_handler=ignore_remote_event,
@@ -197,8 +202,22 @@ class MCPScope:
             name: self.registry.mcp_tools[name]
             for name in profile.tools
             if name in self.registry.mcp_tools
+            and self.registry.mcp_tools[name].selection.execution == "sync"
         }
         actual = {}
+        background_entries = {
+            n: self.registry.mcp_tools[n]
+            for n in profile.tools
+            if n in self.registry.mcp_tools
+            and self.registry.mcp_tools[n].selection.execution == "background"
+        }
+        if background_entries:
+            from agent_service.background import mcp_background_tool
+
+            for alias, entry in background_entries.items():
+                actual[alias] = mcp_background_tool(
+                    self.db, self.row, self.registry, alias, entry
+                )
         init_deadline = asyncio.get_running_loop().time() + self.remaining(
             self.settings.init_timeout
         )
@@ -366,3 +385,10 @@ class MCPBatchMiddleware(AgentMiddleware):
                 status="error",
             )
         return await handler(request)
+
+
+class TaskClient(RestrictedClient):
+    async def _await_with_session_monitoring(self, awaitable):
+        result = await super()._await_with_session_monitoring(awaitable)
+        self.last_explicit_result = result
+        return result

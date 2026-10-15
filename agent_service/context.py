@@ -75,6 +75,26 @@ class RunContextMiddleware(AgentMiddleware):
             "current_run_todos": progress,
             "todo_interpretation": "Model-maintained progress, not completion evidence. Empty means no Todo for this Run. Historical lists are not current state. Always deliver a final answer.",
         }
+        if getattr(ctx, "task_id", None) and getattr(ctx, "task_store", None):
+            context["task_id"] = ctx.task_id
+            context["task"] = {
+                k: str(v)
+                for k, v in (await ctx.task_store.task(ctx.task_id)).items()
+                if k in ("status", "deadline_at", "error_code")
+            }
+            context["background_operations"] = [
+                {
+                    k: str(v)
+                    for k, v in o.items()
+                    if k in ("id", "state", "cleanup_state", "error_code")
+                }
+                for o in await ctx.task_store.operations(ctx.task_id)
+            ]
+            if await ctx.task_store.workspace_background(ctx.task_id):
+                context["workspace_access"] = "read"
+                context["file_consistency"] = (
+                    "A background command may be changing these files. Writes and all ordinary Shell calls are forbidden until cleanup is confirmed."
+                )
         blocks = (
             list(request.system_message.content_blocks)
             if request.system_message

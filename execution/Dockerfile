@@ -6,8 +6,8 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources && \
     rm -rf /var/lib/apt/lists/*
 COPY requirements.lock /opt/agent/requirements.lock
 RUN pip install --no-cache-dir -r /opt/agent/requirements.lock
-COPY execution/helper.py execution/entrypoint.py /opt/agent/
-LABEL io.agent-framework.helper="workspace-v1"
+COPY execution/helper.py execution/entrypoint.py execution/background.py /opt/agent/
+LABEL io.agent-framework.helper="workspace-v1" io.agent-framework.background="background-v1"
 ENV PATH="/usr/local/bin:/usr/bin:/bin" LANG="C.UTF-8" HOME="/tmp" TMPDIR="/tmp"
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/python", "-I", "/opt/agent/entrypoint.py"]

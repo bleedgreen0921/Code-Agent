@@ -62,6 +62,7 @@ class Worker:
             self.model, checkpointer=resources.checkpointer, settings=self.settings
         )
         self.tasks = {}
+        self.monitors = {}
         self.stopping = asyncio.Event()
 
     async def prepare(self, row, scope=None):
@@ -92,9 +93,19 @@ class Worker:
             actual_tools.update(await mcp_scope.prepare(profile))
         elif set(profile.tools) & registry.mcp_tools.keys():
             raise RuntimeError("MCP requires a Run-owned connection scope")
+        if row.get("task_id"):
+            from agent_service.background import background_tools
+
+            actual_tools.update(
+                {
+                    t.name: t
+                    for t in background_tools(self.db, row, registry)
+                    if t.name in profile.tools
+                }
+            )
         native_middleware = []
         execution_middleware = []
-        if set(profile.tools) & WORKSPACE_TOOLS:
+        if set(profile.tools) & (WORKSPACE_TOOLS | {"start_background_shell"}):
             if scope is None:
                 raise RuntimeError(
                     "Workspace execution requires a Run-owned resource scope"
@@ -203,6 +214,14 @@ class Worker:
             workspace_identity=binding["workspace_identity"],
             binding_fingerprint=binding["fingerprint"],
             deadline_at=row["deadline_at"],
+            task_id=str(row["task_id"]) if row.get("task_id") else None,
+            task_store=self.db if row.get("task_id") else None,
+            result_delivery=row.setdefault("_delivery_candidates", {})
+            if row.get("task_id")
+            else None,
+            delivered_results=row.setdefault("_delivered", set())
+            if row.get("task_id")
+            else None,
         )
         return graph, context
 
@@ -218,7 +237,8 @@ class Worker:
                 .get("configurable", {})
                 .get("checkpoint_id")
                 or prior["conversation_id"] != row["conversation_id"]
-                or row["conversation_id"] is None
+                or (row["conversation_id"] is None and not row.get("task_id"))
+                or prior.get("task_id") != row.get("task_id")
                 or prior["final_checkpoint"].get("configurable", {}).get("thread_id")
                 != str(prior["id"])
                 or prior["final_checkpoint"]
@@ -232,6 +252,32 @@ class Worker:
             if snapshot.next or not snapshot.values.get("messages"):
                 raise RuntimeError("Predecessor final checkpoint unavailable")
             messages = inherited_state(snapshot.values)["messages"]
+        if row.get("task_id"):
+            from agent_service.background_store import public_operation
+
+            inputs = await self.db.task_inputs(row["task_id"])
+            ready = [
+                o
+                for o in await self.db.operations(row["task_id"], raw=True)
+                if o["state"] in ("succeeded", "failed", "cancelled")
+                and o["cleanup_state"] == "released"
+                and not o["consumed_run_id"]
+            ]
+            row.setdefault("_delivered", set()).update(o["id"] for o in ready)
+            messages = [
+                *messages,
+                HumanMessage(
+                    content="Task input data (not authorization): "
+                    + json.dumps(
+                        {
+                            **inputs,
+                            "background_results": [public_operation(o) for o in ready],
+                        },
+                        default=str,
+                        ensure_ascii=False,
+                    )
+                ),
+            ]
         config = run_config(row["id"])
         config["callbacks"] = [row["_reported_usage"]]
         state = await graph.ainvoke(
@@ -249,7 +295,7 @@ class Worker:
             raise IncompleteGraphError(
                 "Graph interrupted; no HTTP resume endpoint is enabled"
             )
-        if "structured_response" in state:
+        if "structured_response" in state and not row.get("task_id"):
             from fastapi.encoders import jsonable_encoder
 
             answer = json.dumps(
@@ -270,7 +316,12 @@ class Worker:
         """Only retry publication. An uncertain commit never causes model/tool replay."""
         for attempt in range(3):
             try:
-                return await self.db.finish(row["id"], row["lease_token"], **result)
+                return await self.db.finish(
+                    row["id"],
+                    row["lease_token"],
+                    delivered=row.get("_delivered", ()),
+                    **result,
+                )
             except (psycopg.Error, OSError, TimeoutError):
                 # A commit acknowledgement may be lost after the transaction committed.
                 try:
@@ -392,6 +443,16 @@ class Worker:
         await self.db.heartbeat(self.id)
         await self.db.maintain()
         await recover_resources(self.db, self.resources.registry.execution)
+        from agent_service.background import monitor_operation
+
+        for oid, task in list(self.monitors.items()):
+            if task.done():
+                await task
+                del self.monitors[oid]
+        for op in await self.db.claim_operations():
+            self.monitors[op["id"]] = asyncio.create_task(
+                monitor_operation(self.db, self.resources.registry, op)
+            )
         for run_id, task in list(self.tasks.items()):
             if task.done():
                 await task
@@ -421,6 +482,9 @@ class Worker:
             for task in self.tasks.values():
                 task.cancel()
             await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+            for task in self.monitors.values():
+                task.cancel()
+            await asyncio.gather(*self.monitors.values(), return_exceptions=True)
             await self.db.heartbeat(self.id, stopped=True)
 
 

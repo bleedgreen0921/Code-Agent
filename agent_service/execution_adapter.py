@@ -313,6 +313,16 @@ class WorkspaceExecutionMiddleware(AgentMiddleware):
             async with scope.lock:
                 scope.check_open()
                 await scope.healthy()
+                if (
+                    request.tool_call["name"] in {"edit_file", "shell"}
+                    and scope.row.get("task_id")
+                    and await scope.store.workspace_background(scope.row["task_id"])
+                ):
+                    return ToolMessage(
+                        content='{"code":"BACKGROUND_WORKSPACE_READ_ONLY"}',
+                        tool_call_id=request.tool_call["id"],
+                        status="error",
+                    )
                 run_limited = scope.remaining() <= scope.settings.command_timeout
                 try:
                     async with asyncio.timeout(

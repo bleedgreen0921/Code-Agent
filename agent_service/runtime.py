@@ -29,6 +29,10 @@ from agent_service.policy import (
 @dataclass(frozen=True)
 class RunContext:
     run_id: str
+    task_id: str | None = None
+    task_store: object = None
+    result_delivery: object = None
+    delivered_results: object = None
     conversation_id: str | None = None
     profile: str = "chat"
     workspace_id: str | None = None
@@ -77,6 +81,7 @@ def build_agent(
 ):
     from agent_service.delegation import DelegationBatchMiddleware
     from agent_service.mcp_runtime import MCPBatchMiddleware
+    from agent_service.background import BackgroundBatchMiddleware
 
     cfg = settings or Settings.from_env()
     supplied = [
@@ -120,6 +125,7 @@ def build_agent(
             ),
             DelegationBatchMiddleware(),
             MCPBatchMiddleware(policy),
+            BackgroundBatchMiddleware(policy),
             *(m for m in middleware if not isinstance(m, ToolErrorMiddleware)),
             PermissionMiddleware(policy),
             *(m for m in middleware if isinstance(m, ToolErrorMiddleware)),

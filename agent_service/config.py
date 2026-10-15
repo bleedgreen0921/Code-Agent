@@ -14,6 +14,14 @@ class Settings:
     max_active_runs: int = 2
     max_queued_runs: int = 8
     max_unfinished_runs: int = 10
+    max_unfinished_tasks: int = 32
+    task_timeout: float = 3600
+    background_timeout: float = 1800
+    max_active_operations: int = 2
+    max_task_active_operations: int = 1
+    max_task_operations: int = 4
+    background_poll_seconds: float = 1
+    reconciliation_seconds: float = 30
     summary_trigger_tokens: int = 20000
     summary_keep_tokens: int = 6000
     summary_trim_tokens: int = 16000

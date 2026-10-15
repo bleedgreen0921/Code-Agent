@@ -127,7 +127,10 @@ class Registry:
         )
         self.mcp = config.mcp
         self.mcp_tools = load_catalogs(config.mcp)
+        from agent_service.background import background_tools
+
         tools = (
+            *background_tools(),
             *builtin_tools(),
             *knowledge_tools(),
             *(t.declaration() for t in self.mcp_tools.values()),
@@ -265,7 +268,8 @@ class Registry:
             raise ValueError("Unknown workspace")
         if (
             declaration.requires_workspace
-            or set(declaration.tools) & (WORKSPACE_TOOLS | KNOWLEDGE_TOOLS)
+            or set(declaration.tools)
+            & (WORKSPACE_TOOLS | KNOWLEDGE_TOOLS | {"start_background_shell"})
         ) and workspace_id is None:
             raise ValueError("Profile requires a workspace")
         root = self.workspaces.get(workspace_id)
@@ -352,7 +356,8 @@ class Registry:
                             "execution": self.execution.model_dump(),
                             "tool_implementation": IMPLEMENTATION_VERSION,
                         }
-                        if set(declaration.tools) & WORKSPACE_TOOLS
+                        if set(declaration.tools)
+                        & (WORKSPACE_TOOLS | {"start_background_shell"})
                         else {}
                     ),
                 }

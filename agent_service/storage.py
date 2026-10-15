@@ -12,6 +12,8 @@ from contracts.v1 import ErrorCode
 from psycopg.types.json import Jsonb
 
 from agent_service.profiles import Registry
+from agent_service.tasks import TaskStore
+from agent_service.background_store import BackgroundStore
 
 log = logging.getLogger(__name__)
 ACTIVE = ("queued", "running", "cancelling")
@@ -19,7 +21,7 @@ TERMINAL = ("completed", "failed", "cancelled")
 ADMISSION_LOCK = 81431002
 
 
-class Store:
+class Store(TaskStore, BackgroundStore):
     def __init__(self, pool, settings, registry=None):
         self.pool, self.settings = pool, settings
         self.registry = registry or Registry.from_env()
@@ -35,11 +37,25 @@ class Store:
             revisions = await (
                 await conn.execute("SELECT version_num FROM agent.alembic_version")
             ).fetchall()
-            if revisions != [{"version_num": "core_0004"}]:
+            if revisions != [{"version_num": "core_0005"}]:
                 raise RuntimeError("Core database baseline required")
             await conn.execute("SELECT 1 FROM agent.checkpoints LIMIT 1")
             await conn.execute("SELECT 1 FROM agent.store LIMIT 1")
             await conn.execute("SELECT 1 FROM agent.external_operations LIMIT 1")
+            import json
+            from db.migrate import CORE_QUERIES, ROOT
+
+            signature = {}
+            async with conn.transaction():
+                await conn.execute("SET LOCAL search_path TO public")
+                for key, query in CORE_QUERIES.items():
+                    rows = await (await conn.execute(query)).fetchall()
+                    signature[key] = [list(r.values()) for r in rows]
+            if (
+                signature
+                != json.loads((ROOT / "structure.json").read_text())["core_0005"]
+            ):
+                raise RuntimeError("Core structure mismatch")
             from langgraph.store.postgres import PostgresStore
 
             versions = await (
@@ -109,9 +125,12 @@ class Store:
                 conn, item["run_id"], "external_operation_unknown", "MCP_RESULT_UNKNOWN"
             )
 
+        await self.reconcile_tasks(conn)
+
     async def maintain(self):
         async with self.locked() as conn:
             await self.sweep(conn)
+            await self.schedule_tasks(conn)
 
     def binding(self, profile="chat", workspace_id=None):
         try:
@@ -241,6 +260,19 @@ class Store:
                     ).fetchone()
                 )["n"]
             binding = self.binding(profile, workspace_id)
+            selected = self.registry.profiles[profile]
+            from agent_service.background import BACKGROUND_TOOLS
+
+            if set(selected.tools) & BACKGROUND_TOOLS or any(
+                self.registry.mcp_tools[n].selection.execution == "background"
+                for n in selected.tools
+                if n in self.registry.mcp_tools
+            ):
+                raise ApiError(
+                    422,
+                    ErrorCode.INVALID_REQUEST,
+                    "Background profiles require POST /v1/tasks",
+                )
             counts = await (
                 await conn.execute(
                     "SELECT count(*) FILTER(WHERE status='queued') AS queued,count(*) AS unfinished FROM agent.runs WHERE status IN ('queued','running','cancelling')"
@@ -291,6 +323,7 @@ class Store:
         self,
         *,
         status=None,
+        task_id=None,
         created_after=None,
         created_before=None,
         limit=30,
@@ -300,10 +333,12 @@ class Store:
             rows = await (
                 await conn.execute(
                     """SELECT * FROM agent.runs WHERE
-                (%s::text IS NULL OR status=%s) AND (%s::timestamptz IS NULL OR created_at>%s)
+                (%s::uuid IS NULL OR task_id=%s) AND (%s::text IS NULL OR status=%s) AND (%s::timestamptz IS NULL OR created_at>%s)
                 AND (%s::timestamptz IS NULL OR created_at<%s) AND (%s::uuid IS NULL OR id<%s::uuid)
                 ORDER BY id DESC LIMIT %s""",
                     (
+                        task_id,
+                        task_id,
                         status,
                         status,
                         created_after,
@@ -344,6 +379,14 @@ class Store:
                 and row["conversation_id"] != conversation_id
             ):
                 raise ApiError(404, ErrorCode.NOT_FOUND, "Run not found")
+            if row.get("task_id"):
+                await self.stop_task(conn, row["task_id"])
+                await self.reconcile_tasks(conn)
+                return await (
+                    await conn.execute(
+                        "SELECT * FROM agent.runs WHERE id=%s", (run_id,)
+                    )
+                ).fetchone()
             if row["status"] in TERMINAL or row["status"] == "cancelling":
                 return row
             status = "cancelled" if row["status"] == "queued" else "cancelling"
@@ -361,9 +404,11 @@ class Store:
     async def claim(self, worker_id):
         async with self.locked() as conn:
             await self.sweep(conn)
+            await self.schedule_tasks(conn)
             occupied = await (
                 await conn.execute(
-                    "SELECT run_id,workspace_root FROM agent.execution_resources WHERE state <> 'released'"
+                    """SELECT e.run_id,r.task_id,e.workspace_root FROM agent.execution_resources e JOIN agent.runs r ON r.id=e.run_id WHERE e.state<>'released'
+                    UNION ALL SELECT run_id,task_id,workspace_root FROM agent.background_operations WHERE backend='docker' AND cleanup_state<>'released'"""
                 )
             ).fetchall()
             n = (
@@ -386,7 +431,9 @@ class Store:
                 candidate_root = None
                 try:
                     profile = self.registry.resolve(candidate["submitted_binding"])
-                    if set(profile.tools) & WORKSPACE_TOOLS:
+                    if set(profile.tools) & (
+                        WORKSPACE_TOOLS | {"start_background_shell"}
+                    ):
                         candidate_root = self.registry.workspaces[
                             candidate["workspace_id"]
                         ]
@@ -407,7 +454,7 @@ class Store:
             row = await (
                 await conn.execute(
                     """UPDATE agent.runs SET status='running',worker_id=%s,lease_token=%s,
-                started_at=clock_timestamp(),deadline_at=clock_timestamp()+%s*interval '1 second',
+                started_at=clock_timestamp(),deadline_at=LEAST(clock_timestamp()+%s*interval '1 second',(SELECT deadline_at FROM agent.tasks WHERE id=agent.runs.task_id)),
                 lease_until=clock_timestamp()+%s*interval '1 second' WHERE id=%s
                 RETURNING *,extract(epoch FROM (deadline_at-clock_timestamp())) AS remaining""",
                     (
@@ -434,6 +481,8 @@ class Store:
                     (run_id,lease_token,worker_id,workspace_root,container_name) VALUES(%s,%s,%s,%s,%s)""",
                     (row["id"], token, worker_id, root, name),
                 )
+            if row.get("task_id"):
+                await self.task_transition(conn, row["task_id"], "running")
             await self.event(conn, row["id"], "running")
         return row
 
@@ -540,6 +589,7 @@ class Store:
         checkpoint=None,
         error_code=None,
         cancelled=False,
+        delivered=(),
     ):
         async with self.locked() as conn:
             await self.sweep(conn)
@@ -553,7 +603,22 @@ class Store:
                 "cancelling",
             ):
                 return False
-            if row["status"] == "cancelling" or cancelled:
+            task_failure = None
+            if row.get("task_id"):
+                task_failure = await (
+                    await conn.execute(
+                        "SELECT error_code FROM agent.tasks WHERE id=%s AND status='failed'",
+                        (row["task_id"],),
+                    )
+                ).fetchone()
+            if task_failure:
+                status, answer, checkpoint, error_code = (
+                    "failed",
+                    None,
+                    None,
+                    task_failure["error_code"],
+                )
+            elif row["status"] == "cancelling" or cancelled:
                 status, answer, checkpoint, error_code = "cancelled", None, None, None
             elif error_code:
                 status, answer, checkpoint = "failed", None, None
@@ -595,7 +660,19 @@ class Store:
                     "UPDATE agent.conversations SET last_success_run_id=%s WHERE id=%s",
                     (run_id, row["conversation_id"]),
                 )
+            if row.get("task_id") and status == "completed":
+                await conn.execute(
+                    "UPDATE agent.tasks SET last_success_run_id=%s WHERE id=%s",
+                    (run_id, row["task_id"]),
+                )
+                await conn.execute(
+                    """UPDATE agent.background_operations SET consumed_run_id=%s
+                    WHERE task_id=%s AND id=ANY(%s::uuid[]) AND state IN ('succeeded','failed','cancelled')
+                    AND cleanup_state='released' AND consumed_run_id IS NULL""",
+                    (run_id, row["task_id"], list(delivered)),
+                )
             await self.event(conn, run_id, status, error_code)
+            await self.reconcile_tasks(conn)
         return True
 
     async def external_operations(self, run_id=None):
@@ -656,6 +733,8 @@ def public_run(row):
             "profile",
             "workspace_id",
             "conversation_id",
+            "task_id",
+            "execution_no",
             "turn_no",
             "created_at",
             "started_at",

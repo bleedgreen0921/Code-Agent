@@ -154,7 +154,7 @@ def test_current_baseline_upgrade_preserves_history_queue_and_checkpoints(databa
             ).fetchone() == (completed, "chat")
             assert conn.execute(
                 "SELECT version_num FROM agent.alembic_version"
-            ).fetchone() == ("core_0004",)
+            ).fetchone() == ("core_0005",)
             conn.execute("SET search_path TO agent")
             conn.row_factory = dict_row
             assert PostgresSaver(conn).get_tuple(saved).checkpoint["id"] == cp["id"]
@@ -171,7 +171,7 @@ def test_current_baseline_upgrade_preserves_history_queue_and_checkpoints(databa
             owner.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(name)))
 
 
-@pytest.mark.parametrize("prior_revision", ["core_0002", "core_0003"])
+@pytest.mark.parametrize("prior_revision", ["core_0002", "core_0003", "core_0004"])
 def test_core_0002_upgrade_keeps_queued_binding_and_grants_execution_table(
     database, prior_revision
 ):
@@ -217,7 +217,7 @@ def test_core_0002_upgrade_keeps_queued_binding_and_grants_execution_table(
             migrate.main()
             migrate.main()
         with psycopg.connect(prior) as conn:
-            assert migrate.validate_database(conn) == "core_0004"
+            assert migrate.validate_database(conn) == "core_0005"
             assert conn.execute(
                 "SELECT status,submitted_binding FROM agent.runs WHERE id=%s", (run_id,)
             ).fetchone() == ("queued", DEFAULT_BINDING)
@@ -301,7 +301,7 @@ def test_native_store_known_partial_setup_is_idempotent(database):
                 conn.execute("SET search_path TO public")
                 assert (
                     json.loads(json.dumps(migrate.structure(conn)))
-                    == json.loads(Path("db/structure.json").read_text())["core_0004"]
+                    == json.loads(Path("db/structure.json").read_text())["core_0005"]
                 )
     finally:
         with psycopg.connect(dsn, autocommit=True) as owner:

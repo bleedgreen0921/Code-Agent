@@ -1,7 +1,8 @@
 from enum import StrEnum
 from typing import Literal
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ErrorCode(StrEnum):
@@ -40,4 +41,27 @@ class ConversationCreate(BindingFields):
 
 RunStatus = Literal[
     "queued", "running", "cancelling", "completed", "failed", "cancelled"
+]
+
+
+class TaskCreate(RunCreate):
+    depends_on: list[UUID] = Field(default_factory=list, max_length=8)
+
+    @field_validator("depends_on")
+    @classmethod
+    def unique_dependencies(cls, value):
+        if len(value) != len(set(value)):
+            raise ValueError("Duplicate dependencies")
+        return value
+
+
+TaskStatus = Literal[
+    "waiting_dependencies",
+    "queued",
+    "running",
+    "waiting_background",
+    "cancelling",
+    "completed",
+    "failed",
+    "cancelled",
 ]

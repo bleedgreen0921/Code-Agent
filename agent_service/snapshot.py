@@ -99,10 +99,30 @@ def runtime_snapshot(model, settings, registry, binding, middleware):
                 "read_only_rootfs": True,
             }
             if set(profile.tools)
-            & {"glob_search", "grep_search", "read_file", "edit_file", "shell"}
+            & {
+                "glob_search",
+                "grep_search",
+                "read_file",
+                "edit_file",
+                "shell",
+                "start_background_shell",
+            }
             else None
         ),
         "run_timeout_seconds": settings.run_timeout,
+        "task_limits": {
+            name: getattr(settings, name)
+            for name in (
+                "task_timeout",
+                "background_timeout",
+                "max_unfinished_tasks",
+                "max_active_operations",
+                "max_task_active_operations",
+                "max_task_operations",
+                "background_poll_seconds",
+                "reconciliation_seconds",
+            )
+        },
         "framework": {
             name: version(name)
             for name in (

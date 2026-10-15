@@ -34,6 +34,7 @@ class Selection(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     alias: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
     access: Literal["read", "write"]
+    execution: Literal["sync", "background"] = "sync"
 
 
 class Server(BaseModel):
