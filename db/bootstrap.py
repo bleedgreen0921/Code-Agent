@@ -17,7 +17,7 @@ def main():
             "AGENT_DATABASE_URL requires a dedicated username and password"
         )
     with psycopg.connect(os.environ["MIGRATION_DATABASE_URL"]) as conn:
-        if validate_database(conn) != "core_0003":
+        if validate_database(conn) != "core_0004":
             raise RuntimeError("Run db.migrate before bootstrap")
         owner = conn.execute("SELECT current_user").fetchone()[0]
         if role == owner:
@@ -68,6 +68,8 @@ def main():
             "events",
             "workers",
             "execution_resources",
+            "external_operations",
+            "store",
             "checkpoints",
             "checkpoint_blobs",
             "checkpoint_writes",
@@ -85,13 +87,13 @@ def main():
         )
         conn.execute(
             sql.SQL(
-                "REVOKE ALL ON agent.alembic_version,agent.schema_version,agent.checkpoint_migrations FROM PUBLIC, {}"
+                "REVOKE ALL ON agent.alembic_version,agent.schema_version,agent.checkpoint_migrations,agent.store_migrations FROM PUBLIC, {}"
             ).format(sql.Identifier(role))
         )
         # Startup checks may read these tables; runtime cannot update either revision.
         conn.execute(
             sql.SQL(
-                "GRANT SELECT ON agent.schema_version,agent.alembic_version,agent.checkpoint_migrations TO {}"
+                "GRANT SELECT ON agent.schema_version,agent.alembic_version,agent.checkpoint_migrations,agent.store_migrations TO {}"
             ).format(sql.Identifier(role))
         )
 

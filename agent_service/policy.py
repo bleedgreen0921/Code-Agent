@@ -6,6 +6,8 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from types import MappingProxyType
+from agent_service.schema import local_schema
 from langgraph.types import Command
 
 from langchain.agents.middleware import (
@@ -44,22 +46,36 @@ active_model_call = ContextVar("active_model_call", default=None)
 class ToolLifecycleMiddleware(AgentMiddleware):
     def __init__(self, output_limits=None):
         self.output_limits = output_limits
+        self.batches = {}
+
+    @staticmethod
+    def batch_key(context):
+        return (getattr(context, "run_id", None), getattr(context, "agent_id", None))
+
+    async def aafter_model(self, state, runtime):
+        # First middleware's after_model runs last, before concurrent tool tasks.
+        # Capture once here: sibling tool Hooks may mutate shared message state.
+        messages = state.get("messages", [])
+        calls = getattr(messages[-1], "tool_calls", ()) if messages else ()
+        self.batches[self.batch_key(runtime.context)] = tuple(
+            MappingProxyType({"name": c["name"], "id": c["id"]}) for c in calls
+        )
 
     def limit_result(self, result):
         from agent_service.output import limit_output
 
         if isinstance(result, ToolMessage):
-            content, truncated = limit_output(result.text, *self.output_limits)
-            if truncated:
-                # Arbitrary artifacts are part of the native tool protocol; preserve them.
-                artifact = (
-                    {**result.artifact, "truncated": True}
-                    if isinstance(result.artifact, dict)
-                    else result.artifact
-                )
-                result = result.model_copy(
-                    update={"content": content, "artifact": artifact}
-                )
+            from agent_service.output import safe_content, bounded_artifact
+
+            content, truncated = limit_output(
+                safe_content(result.content), *self.output_limits
+            )
+            artifact = bounded_artifact(result.artifact, self.output_limits[0])
+            if truncated and isinstance(artifact, dict):
+                artifact = {**artifact, "truncated": True}
+            result = result.model_copy(
+                update={"content": content, "artifact": artifact}
+            )
         elif isinstance(result, Command) and isinstance(result.update, dict):
             messages = result.update.get("messages")
             if isinstance(messages, ToolMessage):
@@ -97,12 +113,7 @@ class ToolLifecycleMiddleware(AgentMiddleware):
             request.tool_call["id"],
             request.tool_call["name"],
         )
-        messages = request.state.get("messages", [])
-        call.batch = (
-            tuple(messages[-1].tool_calls)
-            if messages and hasattr(messages[-1], "tool_calls")
-            else ()
-        )
+        call.batch = self.batches.get(self.batch_key(request.runtime.context), ())
         token = active_call.set(call)
         started = time.monotonic()
         try:
@@ -151,6 +162,11 @@ class ToolLifecycleMiddleware(AgentMiddleware):
 class PermissionMiddleware(AgentMiddleware):
     def __init__(self, policy):
         self.policy = policy
+        self.schemas = {
+            name: local_schema(tool.tool_call_schema)
+            for name, tool in policy.tools.items()
+            if isinstance(tool.tool_call_schema, dict)
+        }
 
     async def awrap_tool_call(self, request, handler):
         call = active_call.get()
@@ -185,6 +201,18 @@ class PermissionMiddleware(AgentMiddleware):
             )
         )
         try:
+            if not denied and call.name in self.schemas:
+                try:
+                    self.schemas[call.name].validate(
+                        deepcopy(request.tool_call["args"])
+                    )
+                except Exception:
+                    return ToolMessage(
+                        content='{"code":"INVALID_TOOL_ARGUMENTS","message":"Arguments do not match the tool schema."}',
+                        tool_call_id=call.call_id,
+                        name=call.name,
+                        status="error",
+                    )
             if not denied and call.name in policy.validators:
                 # The same tool schema used by the native executor parses arguments.
                 # Invalid inputs are left to native validation/error formatting.

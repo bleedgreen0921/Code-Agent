@@ -104,6 +104,7 @@ async def trace(
             "submitted_binding": row["submitted_binding"],
             "runtime_config": row["runtime_config"],
             "final_checkpoint": row["final_checkpoint"],
+            "external_operations": await db(request).external_operations(run_id),
             "checkpoints": checkpoints,
         }
     )

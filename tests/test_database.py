@@ -154,7 +154,7 @@ def test_current_baseline_upgrade_preserves_history_queue_and_checkpoints(databa
             ).fetchone() == (completed, "chat")
             assert conn.execute(
                 "SELECT version_num FROM agent.alembic_version"
-            ).fetchone() == ("core_0003",)
+            ).fetchone() == ("core_0004",)
             conn.execute("SET search_path TO agent")
             conn.row_factory = dict_row
             assert PostgresSaver(conn).get_tuple(saved).checkpoint["id"] == cp["id"]
@@ -171,7 +171,10 @@ def test_current_baseline_upgrade_preserves_history_queue_and_checkpoints(databa
             owner.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(name)))
 
 
-def test_core_0002_upgrade_keeps_queued_binding_and_grants_execution_table(database):
+@pytest.mark.parametrize("prior_revision", ["core_0002", "core_0003"])
+def test_core_0002_upgrade_keeps_queued_binding_and_grants_execution_table(
+    database, prior_revision
+):
     from alembic.config import Config
     from alembic import command
     from pathlib import Path
@@ -198,7 +201,7 @@ def test_core_0002_upgrade_keeps_queued_binding_and_grants_execution_table(datab
                     "script_location", str(Path("db/alembic").resolve())
                 )
                 cfg.attributes["connection"] = conn
-                command.upgrade(cfg, "core_0002")
+                command.upgrade(cfg, prior_revision)
         finally:
             engine.dispose()
         run_id = uuid4()
@@ -214,7 +217,7 @@ def test_core_0002_upgrade_keeps_queued_binding_and_grants_execution_table(datab
             migrate.main()
             migrate.main()
         with psycopg.connect(prior) as conn:
-            assert migrate.validate_database(conn) == "core_0003"
+            assert migrate.validate_database(conn) == "core_0004"
             assert conn.execute(
                 "SELECT status,submitted_binding FROM agent.runs WHERE id=%s", (run_id,)
             ).fetchone() == ("queued", DEFAULT_BINDING)
@@ -225,3 +228,81 @@ def test_core_0002_upgrade_keeps_queued_binding_and_grants_execution_table(datab
     finally:
         with psycopg.connect(dsn, autocommit=True) as conn:
             conn.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(name)))
+
+
+def test_native_store_runtime_migration_privileges_and_schema_drift(database):
+    from db.native_store import validate
+
+    with psycopg.connect(os.environ["AGENT_DATABASE_URL"], autocommit=True) as conn:
+        for statement in (
+            "DELETE FROM agent.store_migrations",
+            "INSERT INTO agent.store_migrations VALUES(99)",
+            "ALTER TABLE agent.store ADD COLUMN denied int",
+        ):
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(statement)
+    with psycopg.connect(os.environ["MIGRATION_DATABASE_URL"], autocommit=True) as conn:
+        validate(conn, complete=True)
+        try:
+            conn.execute("ALTER TABLE agent.store ALTER COLUMN value DROP NOT NULL")
+            with pytest.raises(RuntimeError, match="rejected"):
+                migrate.main()
+        finally:
+            conn.execute("ALTER TABLE agent.store ALTER COLUMN value SET NOT NULL")
+        try:
+            conn.execute("INSERT INTO agent.store_migrations VALUES(99)")
+            with pytest.raises(RuntimeError, match="revision"):
+                migrate.main()
+        finally:
+            conn.execute("DELETE FROM agent.store_migrations WHERE v=99")
+
+
+def test_native_store_known_partial_setup_is_idempotent(database):
+    import json
+    from pathlib import Path
+    from langgraph.store.postgres import PostgresStore
+
+    dsn = os.environ["MIGRATION_DATABASE_URL"]
+    name = "agent_test_store_" + uuid4().hex
+    with psycopg.connect(dsn, autocommit=True) as owner:
+        owner.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+    target = make_conninfo(**{**conninfo_to_dict(dsn), "dbname": name})
+    try:
+        # Upgrade core schema first and mimic a Store setup interruption after
+        # each idempotent DDL but before its version record was committed.
+        with patch.dict(os.environ, {"MIGRATION_DATABASE_URL": target}):
+            migrate.main()
+        with psycopg.connect(target, autocommit=True) as conn:
+            conn.execute("SET search_path TO agent")
+            for stop in range(len(PostgresStore.MIGRATIONS)):
+                conn.execute("SET search_path TO agent")
+                conn.execute("DROP TABLE agent.store,agent.store_migrations")
+                conn.execute(
+                    "CREATE TABLE agent.store_migrations(v integer PRIMARY KEY)"
+                )
+                for version, statement in enumerate(
+                    PostgresStore.MIGRATIONS[: stop + 1]
+                ):
+                    conn.execute(statement)
+                    if version < stop:
+                        conn.execute(
+                            "INSERT INTO agent.store_migrations VALUES(%s)", (version,)
+                        )
+                if stop == 1:
+                    conn.execute(
+                        "UPDATE pg_index SET indisvalid=false WHERE indexrelid='agent.store_prefix_idx'::regclass"
+                    )
+                with patch.dict(os.environ, {"MIGRATION_DATABASE_URL": target}):
+                    migrate.main()
+                    migrate.main()
+                assert conn.execute(
+                    "SELECT v FROM agent.store_migrations ORDER BY v"
+                ).fetchall() == [(v,) for v in range(len(PostgresStore.MIGRATIONS))]
+                conn.execute("SET search_path TO public")
+                assert (
+                    json.loads(json.dumps(migrate.structure(conn)))
+                    == json.loads(Path("db/structure.json").read_text())["core_0004"]
+                )
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as owner:
+            owner.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(name)))

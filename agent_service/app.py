@@ -6,6 +6,7 @@ from contracts.local import LoopbackOnly
 from fastapi import FastAPI, Request, Response
 
 from agent_service.api import router
+from agent_service.knowledge import router as knowledge_router
 from agent_service.resources import Resources
 
 
@@ -20,6 +21,7 @@ app = FastAPI(title="Agent execution framework", version="2.0.0", lifespan=lifes
 install_errors(app)
 app.add_middleware(LoopbackOnly)
 app.include_router(router)
+app.include_router(knowledge_router)
 
 
 @app.get("/health")

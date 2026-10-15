@@ -7,6 +7,7 @@ from agent_service.profiles import fingerprint, tool_schema
 from agent_service.execution_config import IMPLEMENTATION_VERSION
 from agent_service.context import CONTEXT_VERSION, TODO_LIMITS, SUMMARY_VERSION
 from agent_service.skills import SKILL_VERSION
+from agent_service.knowledge import manifest as knowledge_manifest
 
 
 def safe_endpoint(endpoint):
@@ -27,6 +28,25 @@ def runtime_snapshot(model, settings, registry, binding, middleware):
     profile = registry.resolve(binding)
     return {
         "version": 1,
+        **(
+            {"knowledge": knowledge_manifest()}
+            if set(profile.tools) & {"knowledge_get", "knowledge_search"}
+            else {}
+        ),
+        **(
+            {
+                "mcp": [
+                    {
+                        **registry.mcp_tools[n].manifest(),
+                        "contract": registry.mcp_tools[n].definition,
+                    }
+                    for n in sorted(profile.tools)
+                    if n in registry.mcp_tools
+                ]
+            }
+            if set(profile.tools) & registry.mcp_tools.keys()
+            else {}
+        ),
         **({"delegation": manifest()} if "delegate_read" in profile.tools else {}),
         "context_policy_version": CONTEXT_VERSION,
         "todo_limits": TODO_LIMITS if "write_todos" in profile.tools else None,

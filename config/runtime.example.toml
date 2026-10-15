@@ -57,3 +57,36 @@ directories = []
 # system_prompt = "Investigate the registered workspace and cite file locations."
 # Two serial starts per Run, one level, child tools are the parent's read subset.
 # Child graphs share the parent container and total deadline; no extra Worker slot.
+
+
+# Human-managed knowledge; Agent access is read-only. Disabled by default.
+[knowledge]
+enabled = false
+# Enabling this also adds knowledge_get/knowledge_search to workspace profiles.
+# [[profiles]]
+# id = "project-knowledge"
+# tools = ["knowledge_get", "knowledge_search"]
+# Workspace binding required; no Docker required for these tools alone.
+
+# API reads local catalogs only. Credentials resolve in Worker/explicit export.
+[mcp]
+init_timeout = 10.0
+call_timeout = 30.0
+cleanup_timeout = 10.0
+# [[mcp.servers]]
+# id = "business"
+# transport = "http"
+# url = "https://mcp.example.com/mcp"
+# account_id = "team-account"
+# catalog = "/srv/agent/catalog/business.json"
+# bearer_env = "BUSINESS_MCP_TOKEN"
+# headers_env = { X-Api-Key = "BUSINESS_MCP_API_KEY" }
+# tools = [
+#   { name = "lookup", alias = "business_lookup", access = "read" },
+#   { name = "create", alias = "business_create", access = "write" },
+# ]
+# [[profiles]]
+# id = "business-agent"
+# tools = ["business_lookup", "business_create"]
+# MCP write authorization is explicit and autonomous; no per-call approval.
+# See docs/项目知识与外部工具.md for catalog export and unknown-result checks.

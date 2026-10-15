@@ -35,16 +35,40 @@ class Store:
             revisions = await (
                 await conn.execute("SELECT version_num FROM agent.alembic_version")
             ).fetchall()
-            if revisions != [{"version_num": "core_0003"}]:
+            if revisions != [{"version_num": "core_0004"}]:
                 raise RuntimeError("Core database baseline required")
             await conn.execute("SELECT 1 FROM agent.checkpoints LIMIT 1")
+            await conn.execute("SELECT 1 FROM agent.store LIMIT 1")
+            await conn.execute("SELECT 1 FROM agent.external_operations LIMIT 1")
+            from langgraph.store.postgres import PostgresStore
+
+            versions = await (
+                await conn.execute("SELECT v FROM agent.store_migrations ORDER BY v")
+            ).fetchall()
+            if versions != [{"v": v} for v in range(len(PostgresStore.MIGRATIONS))]:
+                raise RuntimeError("Native Store migrations required")
+            from db.native_store import QUERIES, check_signature
+
+            actual = {}
+            for key, query in QUERIES.items():
+                rows = await (await conn.execute(query)).fetchall()
+                actual[key] = [list(r.values()) for r in rows]
+            check_signature(actual, [r["v"] for r in versions], complete=True)
+            invalid = await (
+                await conn.execute(
+                    """SELECT 1 FROM pg_index WHERE indrelid IN ('agent.store'::regclass,'agent.store_migrations'::regclass) AND NOT indisvalid"""
+                )
+            ).fetchone()
+            if invalid:
+                raise RuntimeError("Native Store has invalid indexes")
             await conn.execute("SELECT run_id FROM agent.execution_resources LIMIT 1")
             privileges = await (
                 await conn.execute("""SELECT has_schema_privilege(current_user,'agent','CREATE') AS ddl,
                 has_database_privilege(current_user,current_database(),'CREATE') AS db_ddl,
                 has_table_privilege(current_user,'agent.alembic_version','INSERT,UPDATE,DELETE,TRUNCATE') OR
                 has_table_privilege(current_user,'agent.schema_version','INSERT,UPDATE,DELETE,TRUNCATE') OR
-                has_table_privilege(current_user,'agent.checkpoint_migrations','INSERT,UPDATE,DELETE,TRUNCATE') AS revision_write""")
+                has_table_privilege(current_user,'agent.checkpoint_migrations','INSERT,UPDATE,DELETE,TRUNCATE') OR
+                has_table_privilege(current_user,'agent.store_migrations','INSERT,UPDATE,DELETE,TRUNCATE') AS revision_write""")
             ).fetchone()
             if any(privileges.values()):
                 raise RuntimeError(
@@ -73,6 +97,17 @@ class Store:
         ).fetchall()
         for row in rows:
             await self.event(conn, row["id"], row["status"], row["error_code"])
+        unknown = await (
+            await conn.execute("""UPDATE agent.external_operations AS op
+            SET state='unknown',error_code='MCP_RESULT_UNKNOWN',finished_at=clock_timestamp()
+            FROM agent.runs AS r WHERE op.run_id=r.id AND op.state='dispatched'
+            AND (r.status IN ('completed','failed','cancelled') OR r.lease_until<=clock_timestamp()
+                 OR r.lease_token<>op.lease_token) RETURNING op.run_id""")
+        ).fetchall()
+        for item in unknown:
+            await self.event(
+                conn, item["run_id"], "external_operation_unknown", "MCP_RESULT_UNKNOWN"
+            )
 
     async def maintain(self):
         async with self.locked() as conn:
@@ -563,6 +598,15 @@ class Store:
             await self.event(conn, run_id, status, error_code)
         return True
 
+    async def external_operations(self, run_id=None):
+        async with self.pool.connection() as conn:
+            return await (
+                await conn.execute(
+                    "SELECT * FROM agent.external_operations WHERE (%s::uuid IS NULL OR run_id=%s) ORDER BY dispatched_at,call_id",
+                    (run_id, run_id),
+                )
+            ).fetchall()
+
     async def timeline(self, run_id):
         await self.get(run_id)
         async with self.pool.connection() as conn:
@@ -572,7 +616,11 @@ class Store:
                     (run_id,),
                 )
             ).fetchall()
-        return {"run_id": str(run_id), "events": rows}
+        return {
+            "run_id": str(run_id),
+            "events": rows,
+            "external_operations": await self.external_operations(run_id),
+        }
 
     async def heartbeat(self, worker_id, *, stopped=False):
         async with self.pool.connection() as conn:

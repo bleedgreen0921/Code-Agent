@@ -18,7 +18,14 @@ from agent_service.execution_config import (
     WORKSPACE_TOOLS,
     IMPLEMENTATION_VERSION,
 )
+from agent_service.mcp_config import MCPSettings, load_catalogs, MAX_CATALOG_BYTES
 from agent_service.workspace_tools import builtin_tools
+from agent_service.knowledge import (
+    KnowledgeSettings,
+    KNOWLEDGE_TOOLS,
+    knowledge_tools,
+    manifest as knowledge_manifest,
+)
 from agent_service.delegation import (
     delegate_tool,
     manifest as delegation_manifest,
@@ -79,6 +86,8 @@ class RuntimeFile(Declaration):
     profiles: list[Profile] = []
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
+    knowledge: KnowledgeSettings = Field(default_factory=KnowledgeSettings)
+    mcp: MCPSettings = Field(default_factory=MCPSettings)
 
 
 @dataclass(frozen=True)
@@ -116,8 +125,12 @@ class Registry:
             config.execution.output_bytes,
             config.execution.output_lines,
         )
+        self.mcp = config.mcp
+        self.mcp_tools = load_catalogs(config.mcp)
         tools = (
             *builtin_tools(),
+            *knowledge_tools(),
+            *(t.declaration() for t in self.mcp_tools.values()),
             delegate_tool(),
             *TodoListMiddleware().tools,
             read_skill_tool({}),
@@ -138,6 +151,7 @@ class Registry:
         if "chat" in self.extensions:
             raise ValueError("chat is reserved")
         self.execution = config.execution
+        self.knowledge = config.knowledge
         profiles = {
             "chat": Profile(id="chat"),
             "workspace_read": Profile(
@@ -148,6 +162,7 @@ class Registry:
                     "read_file",
                     "write_todos",
                     "delegate_read",
+                    *(sorted(KNOWLEDGE_TOOLS) if self.knowledge.enabled else ()),
                     *(("read_skill",) if self.skills else ()),
                 ),
                 skills=tuple(sorted(self.skills)),
@@ -163,6 +178,7 @@ class Registry:
                     "shell",
                     "write_todos",
                     "delegate_read",
+                    *(sorted(KNOWLEDGE_TOOLS) if self.knowledge.enabled else ()),
                     *(("read_skill",) if self.skills else ()),
                 ),
                 skills=tuple(sorted(self.skills)),
@@ -194,6 +210,18 @@ class Registry:
         ):
             raise ValueError("Unknown extension profile or validator tool")
         for profile in profiles.values():
+            selected = [
+                self.mcp_tools[n].definition
+                for n in profile.tools
+                if n in self.mcp_tools
+            ]
+            if (
+                len(json.dumps(selected, ensure_ascii=False).encode())
+                > MAX_CATALOG_BYTES
+            ):
+                raise ValueError("Profile MCP schema and description exceed 32 KiB")
+            if set(profile.tools) & KNOWLEDGE_TOOLS and not self.knowledge.enabled:
+                raise ValueError("Knowledge tools require knowledge.enabled")
             if "delegate_read" in profile.tools and not set(profile.tools) & READ_TOOLS:
                 raise ValueError("delegate_read requires a workspace read/search tool")
             if (
@@ -236,7 +264,8 @@ class Registry:
         if workspace_id is not None and workspace_id not in self.workspaces:
             raise ValueError("Unknown workspace")
         if (
-            declaration.requires_workspace or set(declaration.tools) & WORKSPACE_TOOLS
+            declaration.requires_workspace
+            or set(declaration.tools) & (WORKSPACE_TOOLS | KNOWLEDGE_TOOLS)
         ) and workspace_id is None:
             raise ValueError("Profile requires a workspace")
         root = self.workspaces.get(workspace_id)
@@ -277,12 +306,40 @@ class Registry:
                                 "lines": self.execution.output_lines,
                             }
                         }
-                        if set(declaration.tools) & {"write_todos", "read_skill"}
+                        if set(declaration.tools)
+                        & (
+                            {"write_todos", "read_skill"}
+                            | KNOWLEDGE_TOOLS
+                            | self.mcp_tools.keys()
+                        )
                         else {}
                     ),
                     **(
                         {"delegation": delegation_manifest()}
                         if "delegate_read" in declaration.tools
+                        else {}
+                    ),
+                    **(
+                        {"knowledge": knowledge_manifest()}
+                        if set(declaration.tools) & KNOWLEDGE_TOOLS
+                        else {}
+                    ),
+                    **(
+                        {
+                            "mcp": {
+                                "limits": {
+                                    "init": self.mcp.init_timeout,
+                                    "call": self.mcp.call_timeout,
+                                    "cleanup": self.mcp.cleanup_timeout,
+                                },
+                                "tools": [
+                                    self.mcp_tools[n].manifest()
+                                    for n in sorted(declaration.tools)
+                                    if n in self.mcp_tools
+                                ],
+                            }
+                        }
+                        if set(declaration.tools) & self.mcp_tools.keys()
                         else {}
                     ),
                     "tools": sorted(declaration.tools),

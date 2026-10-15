@@ -69,6 +69,29 @@ class Worker:
         binding = row["submitted_binding"]
         profile = registry.resolve(binding)
         actual_tools = {name: registry.tools[name] for name in profile.tools}
+        graph_store = self.native_store
+        if registry.knowledge.enabled and binding["workspace_id"]:
+            from agent_service.knowledge import (
+                ReadOnlyStore,
+                knowledge_tools,
+                namespace,
+            )
+
+            graph_store = ReadOnlyStore(
+                self.resources.knowledge_store,
+                namespace(binding["workspace_id"], binding["workspace_identity"]),
+            )
+            actual_tools.update(
+                {
+                    t.name: t
+                    for t in knowledge_tools(graph_store)
+                    if t.name in profile.tools
+                }
+            )
+        if mcp_scope := row.get("_mcp_scope"):
+            actual_tools.update(await mcp_scope.prepare(profile))
+        elif set(profile.tools) & registry.mcp_tools.keys():
+            raise RuntimeError("MCP requires a Run-owned connection scope")
         native_middleware = []
         execution_middleware = []
         if set(profile.tools) & WORKSPACE_TOOLS:
@@ -153,7 +176,7 @@ class Worker:
             self.model,
             checkpointer=self.resources.checkpointer,
             tools=graph_tools,
-            store=self.native_store,
+            store=graph_store,
             settings=self.settings,
             system_prompt=profile.system_prompt,
             middleware=middleware,
@@ -270,6 +293,17 @@ class Worker:
             if await self.db.execution_resource(row["id"])
             else None
         )
+        from agent_service.mcp_runtime import MCPScope
+
+        mcp_scope = None
+        try:
+            profile = self.resources.registry.resolve(row["submitted_binding"])
+            if set(profile.tools) & self.resources.registry.mcp_tools.keys():
+                mcp_scope = row["_mcp_scope"] = MCPScope(
+                    self.db, row, self.resources.registry
+                )
+        except ConfigurationChanged:
+            pass  # prepare publishes the established configuration error.
         work = asyncio.create_task(self.generate(row, scope))
         lost = False
         cancelled = False
@@ -319,6 +353,8 @@ class Worker:
             )
         finally:
             # Freeze admissions before cancelling graph work; executor threads cannot respawn.
+            if mcp_scope:
+                mcp_scope.closing = True
             if scope:
                 with scope.sync_lock:
                     scope.closing = True
@@ -336,7 +372,9 @@ class Worker:
                     },
                 )
             try:
+                mcp_clean = await mcp_scope.close() if mcp_scope else True
                 clean = await scope.close() if scope else True
+                clean = clean and mcp_clean
                 if not clean and not result.get("error_code"):
                     result = {"error_code": "RESOURCE_CLEANUP_FAILED"}
                 if not lost:

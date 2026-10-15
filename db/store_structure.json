@@ -1,0 +1,413 @@
+{
+  "-1": {
+    "columns": [
+      [
+        "store_migrations",
+        "v",
+        "integer",
+        "int4",
+        "NO",
+        null,
+        "NO"
+      ]
+    ],
+    "constraints": [
+      [
+        "store_migrations",
+        "store_migrations_pkey",
+        "PRIMARY KEY (v)"
+      ]
+    ],
+    "indexes": [
+      [
+        "store_migrations",
+        "store_migrations_pkey",
+        "CREATE UNIQUE INDEX store_migrations_pkey ON agent.store_migrations USING btree (v)"
+      ]
+    ]
+  },
+  "0": {
+    "columns": [
+      [
+        "store",
+        "prefix",
+        "text",
+        "text",
+        "NO",
+        null,
+        "NO"
+      ],
+      [
+        "store",
+        "key",
+        "text",
+        "text",
+        "NO",
+        null,
+        "NO"
+      ],
+      [
+        "store",
+        "value",
+        "jsonb",
+        "jsonb",
+        "NO",
+        null,
+        "NO"
+      ],
+      [
+        "store",
+        "created_at",
+        "timestamp with time zone",
+        "timestamptz",
+        "YES",
+        "CURRENT_TIMESTAMP",
+        "NO"
+      ],
+      [
+        "store",
+        "updated_at",
+        "timestamp with time zone",
+        "timestamptz",
+        "YES",
+        "CURRENT_TIMESTAMP",
+        "NO"
+      ],
+      [
+        "store_migrations",
+        "v",
+        "integer",
+        "int4",
+        "NO",
+        null,
+        "NO"
+      ]
+    ],
+    "constraints": [
+      [
+        "store",
+        "store_pkey",
+        "PRIMARY KEY (prefix, key)"
+      ],
+      [
+        "store_migrations",
+        "store_migrations_pkey",
+        "PRIMARY KEY (v)"
+      ]
+    ],
+    "indexes": [
+      [
+        "store",
+        "store_pkey",
+        "CREATE UNIQUE INDEX store_pkey ON agent.store USING btree (prefix, key)"
+      ],
+      [
+        "store_migrations",
+        "store_migrations_pkey",
+        "CREATE UNIQUE INDEX store_migrations_pkey ON agent.store_migrations USING btree (v)"
+      ]
+    ]
+  },
+  "1": {
+    "columns": [
+      [
+        "store",
+        "prefix",
+        "text",
+        "text",
+        "NO",
+        null,
+        "NO"
+      ],
+      [
+        "store",
+        "key",
+        "text",
+        "text",
+        "NO",
+        null,
+        "NO"
+      ],
+      [
+        "store",
+        "value",
+        "jsonb",
+        "jsonb",
+        "NO",
+        null,
+        "NO"
+      ],
+      [
+        "store",
+        "created_at",
+        "timestamp with time zone",
+        "timestamptz",
+        "YES",
+        "CURRENT_TIMESTAMP",
+        "NO"
+      ],
+      [
+        "store",
+        "updated_at",
+        "timestamp with time zone",
+        "timestamptz",
+        "YES",
+        "CURRENT_TIMESTAMP",
+        "NO"
+      ],
+      [
+        "store_migrations",
+        "v",
+        "integer",
+        "int4",
+        "NO",
+        null,
+        "NO"
+      ]
+    ],
+    "constraints": [
+      [
+        "store",
+        "store_pkey",
+        "PRIMARY KEY (prefix, key)"
+      ],
+      [
+        "store_migrations",
+        "store_migrations_pkey",
+        "PRIMARY KEY (v)"
+      ]
+    ],
+    "indexes": [
+      [
+        "store",
+        "store_pkey",
+        "CREATE UNIQUE INDEX store_pkey ON agent.store USING btree (prefix, key)"
+      ],
+      [
+        "store",
+        "store_prefix_idx",
+        "CREATE INDEX store_prefix_idx ON agent.store USING btree (prefix text_pattern_ops)"
+      ],
+      [
+        "store_migrations",
+        "store_migrations_pkey",
+        "CREATE UNIQUE INDEX store_migrations_pkey ON agent.store_migrations USING btree (v)"
+      ]
+    ]
+  },
+  "2": {
+    "columns": [
+      [
+        "store",
+        "prefix",
+        "text",
+        "text",
+        "NO",
+        null,
+        "NO"
+      ],
+      [
+        "store",
+        "key",
+        "text",
+        "text",
+        "NO",
+        null,
+        "NO"
+      ],
+      [
+        "store",
+        "value",
+        "jsonb",
+        "jsonb",
+        "NO",
+        null,
+        "NO"
+      ],
+      [
+        "store",
+        "created_at",
+        "timestamp with time zone",
+        "timestamptz",
+        "YES",
+        "CURRENT_TIMESTAMP",
+        "NO"
+      ],
+      [
+        "store",
+        "updated_at",
+        "timestamp with time zone",
+        "timestamptz",
+        "YES",
+        "CURRENT_TIMESTAMP",
+        "NO"
+      ],
+      [
+        "store",
+        "expires_at",
+        "timestamp with time zone",
+        "timestamptz",
+        "YES",
+        null,
+        "NO"
+      ],
+      [
+        "store",
+        "ttl_minutes",
+        "integer",
+        "int4",
+        "YES",
+        null,
+        "NO"
+      ],
+      [
+        "store_migrations",
+        "v",
+        "integer",
+        "int4",
+        "NO",
+        null,
+        "NO"
+      ]
+    ],
+    "constraints": [
+      [
+        "store",
+        "store_pkey",
+        "PRIMARY KEY (prefix, key)"
+      ],
+      [
+        "store_migrations",
+        "store_migrations_pkey",
+        "PRIMARY KEY (v)"
+      ]
+    ],
+    "indexes": [
+      [
+        "store",
+        "store_pkey",
+        "CREATE UNIQUE INDEX store_pkey ON agent.store USING btree (prefix, key)"
+      ],
+      [
+        "store",
+        "store_prefix_idx",
+        "CREATE INDEX store_prefix_idx ON agent.store USING btree (prefix text_pattern_ops)"
+      ],
+      [
+        "store_migrations",
+        "store_migrations_pkey",
+        "CREATE UNIQUE INDEX store_migrations_pkey ON agent.store_migrations USING btree (v)"
+      ]
+    ]
+  },
+  "3": {
+    "columns": [
+      [
+        "store",
+        "prefix",
+        "text",
+        "text",
+        "NO",
+        null,
+        "NO"
+      ],
+      [
+        "store",
+        "key",
+        "text",
+        "text",
+        "NO",
+        null,
+        "NO"
+      ],
+      [
+        "store",
+        "value",
+        "jsonb",
+        "jsonb",
+        "NO",
+        null,
+        "NO"
+      ],
+      [
+        "store",
+        "created_at",
+        "timestamp with time zone",
+        "timestamptz",
+        "YES",
+        "CURRENT_TIMESTAMP",
+        "NO"
+      ],
+      [
+        "store",
+        "updated_at",
+        "timestamp with time zone",
+        "timestamptz",
+        "YES",
+        "CURRENT_TIMESTAMP",
+        "NO"
+      ],
+      [
+        "store",
+        "expires_at",
+        "timestamp with time zone",
+        "timestamptz",
+        "YES",
+        null,
+        "NO"
+      ],
+      [
+        "store",
+        "ttl_minutes",
+        "integer",
+        "int4",
+        "YES",
+        null,
+        "NO"
+      ],
+      [
+        "store_migrations",
+        "v",
+        "integer",
+        "int4",
+        "NO",
+        null,
+        "NO"
+      ]
+    ],
+    "constraints": [
+      [
+        "store",
+        "store_pkey",
+        "PRIMARY KEY (prefix, key)"
+      ],
+      [
+        "store_migrations",
+        "store_migrations_pkey",
+        "PRIMARY KEY (v)"
+      ]
+    ],
+    "indexes": [
+      [
+        "store",
+        "idx_store_expires_at",
+        "CREATE INDEX idx_store_expires_at ON agent.store USING btree (expires_at) WHERE (expires_at IS NOT NULL)"
+      ],
+      [
+        "store",
+        "store_pkey",
+        "CREATE UNIQUE INDEX store_pkey ON agent.store USING btree (prefix, key)"
+      ],
+      [
+        "store",
+        "store_prefix_idx",
+        "CREATE INDEX store_prefix_idx ON agent.store USING btree (prefix text_pattern_ops)"
+      ],
+      [
+        "store_migrations",
+        "store_migrations_pkey",
+        "CREATE UNIQUE INDEX store_migrations_pkey ON agent.store_migrations USING btree (v)"
+      ]
+    ]
+  }
+}

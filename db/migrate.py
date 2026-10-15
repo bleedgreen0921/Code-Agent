@@ -8,11 +8,13 @@ import psycopg
 from alembic import command
 from alembic.config import Config
 from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.store.postgres import PostgresStore
 from psycopg.rows import dict_row
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
-VERSION = "core_0003"
+VERSION = "core_0004"
+STORE_TABLES = {"store", "store_migrations"}
 CORE_TABLES = {"schema_version", "conversations", "runs", "events", "workers"}
 CHECKPOINT_TABLES = {
     "checkpoint_migrations",
@@ -28,15 +30,15 @@ def structure(conn):
     return {
         "columns": conn.execute("""SELECT table_name,column_name,data_type,udt_name,is_nullable,column_default,is_identity
             FROM information_schema.columns WHERE table_schema='agent'
-            AND table_name IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources')
+            AND table_name IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources','external_operations')
             ORDER BY table_name,ordinal_position""").fetchall(),
         "constraints": conn.execute("""SELECT c.relname,con.conname,pg_get_constraintdef(con.oid)
             FROM pg_constraint con JOIN pg_class c ON c.oid=con.conrelid
             JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='agent'
-            AND c.relname IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources')
+            AND c.relname IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources','external_operations')
             ORDER BY 1,2""").fetchall(),
         "indexes": conn.execute("""SELECT tablename,indexname,indexdef FROM pg_indexes WHERE schemaname='agent'
-            AND tablename IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources')
+            AND tablename IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources','external_operations')
             ORDER BY 1,2""").fetchall(),
     }
 
@@ -73,7 +75,11 @@ def validate_database(conn):
     if schemas != {"agent"} or any(
         s != "agent"
         or (
-            t not in CORE_TABLES | CHECKPOINT_TABLES | {"alembic_version", "execution_resources"}
+            t
+            not in CORE_TABLES
+            | CHECKPOINT_TABLES
+            | STORE_TABLES
+            | {"alembic_version", "execution_resources", "external_operations"}
             and (t, k) != ("events_id_seq", "S")
         )
         or (t != "events_id_seq" and k != "r")
@@ -94,12 +100,20 @@ def validate_database(conn):
         revisions = conn.execute(
             "SELECT version_num FROM agent.alembic_version"
         ).fetchall()
-        if revisions not in [[("core_0001",)], [("core_0002",)], [("core_0003",)]]:
+        if revisions not in [
+            [("core_0001",)],
+            [("core_0002",)],
+            [("core_0003",)],
+            [("core_0004",)],
+        ]:
             raise RuntimeError("Unknown revision rejected without modification")
         revision = revisions[0][0]
     expected = json.loads((ROOT / "structure.json").read_text())[revision]
     if json.loads(json.dumps(structure(conn))) != expected:
         raise RuntimeError("Core structure mismatch rejected without modification")
+    from db.native_store import validate
+
+    validate(conn)
     return revision
 
 
@@ -137,6 +151,14 @@ def main():
                 conn.execute("SET search_path TO agent")
                 conn.row_factory = dict_row
                 PostgresSaver(conn).setup()
+                invalid = conn.execute(
+                    """SELECT 1 FROM pg_index WHERE indexrelid=to_regclass('agent.store_prefix_idx') AND NOT indisvalid"""
+                ).fetchone()
+                if invalid:
+                    # Only the exact known interrupted concurrent-index step was
+                    # admitted by preflight; repair outside a transaction.
+                    conn.execute("DROP INDEX CONCURRENTLY agent.store_prefix_idx")
+                PostgresStore(conn, index=None, ttl=None).setup()
             finally:
                 conn.rollback()
                 conn.execute("SELECT pg_advisory_unlock(81431001)")

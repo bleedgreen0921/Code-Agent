@@ -53,3 +53,8 @@ Todo 的可信参数验证在最终 Hook 改写后执行；使用框架自身组
 `delegations` 为最多两条原生父状态记录：delegation_id、original_tool_call_id、status、error_code、namespace、final_checkpoint、model_calls、tool_calls 和 reported_usage。失败子图保留中间原生 checkpoint，可按 metadata 中 parent_run_id/delegation_id/original_tool_call_id/agent_depth/delegation_version 追踪；仅成功子图有最终关联指针。reported_usage.models 为模型报告聚合，complete=false 表示缺失报告或异常中止，missing_reports 记录缺失数；不得将缺失用量解释为零。
 
 HTTP `/v1/runs/{run_id}/trace?namespace=...` 与 CLI `python -m db.trace_run RUN_UUID --namespace ...` 精确过滤 namespace，省略读取全部，空字符串读取根。子 namespace 由框架生成，复制实际 trace 值，不自行构造。子 checkpoint 不用于执行恢复，父最终指针和会话继承都限定根 namespace。Run 重启后不恢复父子执行。
+
+
+## 阶段五补充
+
+项目知识使用限定工作区的原生 PostgreSQL Store 只读视图；人工管理 API 以 ETag 和事务级锁完成创建、更新及删除。MCP 采用静态 HTTP 服务、冻结目录、Profile 白名单与每 Run 独立原生 MCPAdapter；外部写入先确认派发记录，未知结果不重发。core_0004 新增 external_operations，trace/timeline/doctor 提供关联核对。详细契约、配置、部署和故障处理见 [项目知识与外部工具](项目知识与外部工具.md)。

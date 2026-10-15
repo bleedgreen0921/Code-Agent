@@ -76,6 +76,7 @@ def build_agent(
     tool_call_limit=10,
 ):
     from agent_service.delegation import DelegationBatchMiddleware
+    from agent_service.mcp_runtime import MCPBatchMiddleware
 
     cfg = settings or Settings.from_env()
     supplied = [
@@ -118,6 +119,7 @@ def build_agent(
                 summary_prompt=SUMMARY_PROMPT,
             ),
             DelegationBatchMiddleware(),
+            MCPBatchMiddleware(policy),
             *(m for m in middleware if not isinstance(m, ToolErrorMiddleware)),
             PermissionMiddleware(policy),
             *(m for m in middleware if isinstance(m, ToolErrorMiddleware)),

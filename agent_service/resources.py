@@ -47,6 +47,13 @@ class Resources:
                 httpx.Client(timeout=self.settings.model_timeout)
             )
             self.checkpointer = AsyncPostgresSaver(self.pool)
+            self.knowledge_store = None
+            if self.registry.knowledge.enabled:
+                from agent_service.knowledge import native_store
+
+                self.knowledge_store = await self.stack.enter_async_context(
+                    native_store(self.pool)
+                )
             from agent_service.storage import Store
 
             self.store = Store(self.pool, self.settings, self.registry)

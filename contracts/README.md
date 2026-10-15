@@ -35,3 +35,8 @@
 内置 workspace_read/workspace_write 必须指定已注册 workspace_id。HTTP 不接受宿主路径、镜像、Docker 参数或环境变量。工作区直接修改，取消和失败不回滚。所有工作区工具在无网络 Docker 容器内运行；空工具 chat 不依赖 Docker。
 
 工具超时为 COMMAND_TIMEOUT；环境准备失败为 EXECUTION_ENVIRONMENT_UNAVAILABLE；执行容器或进程异常退出为 EXECUTION_ENVIRONMENT_LOST；正常执行后清理未确认时为 RESOURCE_CLEANUP_FAILED。清理确认前不发布 completed，未释放资源持续占用工作区和执行容量。timeline 包含 environment_preparing、environment_active、environment_closing、environment_cleanup_failed、environment_released、environment_recovered；这些事件不是新的 Run 状态。
+
+
+## 阶段五补充
+
+项目知识使用限定工作区的原生 PostgreSQL Store 只读视图；人工管理 API 以 ETag 和事务级锁完成创建、更新及删除。MCP 采用静态 HTTP 服务、冻结目录、Profile 白名单与每 Run 独立原生 MCPAdapter；外部写入先确认派发记录，未知结果不重发。core_0004 新增 external_operations，trace/timeline/doctor 提供关联核对。详细契约、配置、部署和故障处理见 [项目知识与外部工具](../docs/项目知识与外部工具.md)。

@@ -30,3 +30,8 @@ RunContextMiddleware 在每次主模型调用前重建可信运行约束、技�
 子调用以 values/checkpoints 流和同步 durability 等待完成，再核对最终 checkpoint 无 next/interrupt、最终 AI 文本合法且明确指针已持久化。成功仅通过 ToolMessage 返回最终文本，Command 将最多两条关联诊断写入父原生状态。局部失败只有原生调用配额、明确 SDK 模型错误、非法最终文本；其它异常沿 await 链外传，父生命周期防止 Hook 吞掉控制错误。Run 取消后冻结父 scope，等待图和本地执行收敛，再使用既有清理和发布流程。
 
 根用量回调只挂一次，随调用链观察父、子、原生摘要；子回调单独记录自身报告，不再加回根聚合。成功汇总写入父状态，异常结束的日志明确标记不完整。trace 直接读原生 checkpointer，支持可选 namespace 精确过滤；默认全部读取。父图发布和跨 Run 继承明确限定根 namespace，子成功状态无法更新会话成功指针。子调用无独立 Run、额外队列/槽位、恢复或进度端点；阶段四仍使用 core_0003。
+
+
+## 阶段五补充
+
+项目知识使用限定工作区的原生 PostgreSQL Store 只读视图；人工管理 API 以 ETag 和事务级锁完成创建、更新及删除。MCP 采用静态 HTTP 服务、冻结目录、Profile 白名单与每 Run 独立原生 MCPAdapter；外部写入先确认派发记录，未知结果不重发。core_0004 新增 external_operations，trace/timeline/doctor 提供关联核对。详细契约、配置、部署和故障处理见 [项目知识与外部工具](项目知识与外部工具.md)。
