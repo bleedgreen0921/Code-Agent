@@ -13,3 +13,10 @@ def encode_trace(value):
             ),
         },
     )
+
+
+def trace_config(run_id, namespace=None):
+    config = {"configurable": {"thread_id": str(run_id)}}
+    if namespace is not None:
+        config["configurable"]["checkpoint_ns"] = namespace
+    return config

@@ -31,6 +31,7 @@ class Call:
     context: object
     call_id: str
     name: str
+    batch: tuple = ()
     entered: bool = False
     violation: BaseException | None = None
     failure: BaseException | None = None
@@ -95,6 +96,12 @@ class ToolLifecycleMiddleware(AgentMiddleware):
             request.runtime.context,
             request.tool_call["id"],
             request.tool_call["name"],
+        )
+        messages = request.state.get("messages", [])
+        call.batch = (
+            tuple(messages[-1].tool_calls)
+            if messages and hasattr(messages[-1], "tool_calls")
+            else ()
         )
         token = active_call.set(call)
         started = time.monotonic()

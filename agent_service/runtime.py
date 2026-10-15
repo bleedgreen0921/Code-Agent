@@ -36,6 +36,9 @@ class RunContext:
     workspace_identity: str | None = None
     binding_fingerprint: str | None = None
     deadline_at: datetime | None = None
+    agent_id: str | None = None
+    parent_agent_id: str | None = None
+    agent_depth: int = 0
 
 
 def model_from_resources(resources):
@@ -69,7 +72,11 @@ def build_agent(
     execution_middleware=(),
     output_limits=None,
     skills=(),
+    model_call_limit=16,
+    tool_call_limit=10,
 ):
+    from agent_service.delegation import DelegationBatchMiddleware
+
     cfg = settings or Settings.from_env()
     supplied = [
         *tools,
@@ -101,8 +108,8 @@ def build_agent(
         response_format=response_format,
         middleware=[
             ToolLifecycleMiddleware(output_limits or (16384, 200)),
-            ModelCallLimitMiddleware(run_limit=16, exit_behavior="error"),
-            ToolCallLimitMiddleware(run_limit=10, exit_behavior="error"),
+            ModelCallLimitMiddleware(run_limit=model_call_limit, exit_behavior="error"),
+            ToolCallLimitMiddleware(run_limit=tool_call_limit, exit_behavior="error"),
             SummarizationMiddleware(
                 model,
                 trigger=("tokens", cfg.summary_trigger_tokens),
@@ -110,6 +117,7 @@ def build_agent(
                 trim_tokens_to_summarize=cfg.summary_trim_tokens,
                 summary_prompt=SUMMARY_PROMPT,
             ),
+            DelegationBatchMiddleware(),
             *(m for m in middleware if not isinstance(m, ToolErrorMiddleware)),
             PermissionMiddleware(policy),
             *(m for m in middleware if isinstance(m, ToolErrorMiddleware)),

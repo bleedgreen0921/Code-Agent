@@ -48,3 +48,12 @@ directories = []
 # id = "review-planner"
 # tools = ["write_todos", "read_skill"]
 # skills = ["code-review"]
+
+# workspace_read/workspace_write also enable delegate_read by default.
+# Custom profiles opt in and must include at least one workspace read/search tool.
+# [[profiles]]
+# id = "read-with-delegation"
+# tools = ["glob_search", "grep_search", "read_file", "delegate_read"]
+# system_prompt = "Investigate the registered workspace and cite file locations."
+# Two serial starts per Run, one level, child tools are the parent's read subset.
+# Child graphs share the parent container and total deadline; no extra Worker slot.

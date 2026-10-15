@@ -19,6 +19,11 @@ from agent_service.execution_config import (
     IMPLEMENTATION_VERSION,
 )
 from agent_service.workspace_tools import builtin_tools
+from agent_service.delegation import (
+    delegate_tool,
+    manifest as delegation_manifest,
+    READ_TOOLS,
+)
 from agent_service.skills import (
     load_skills,
     read_skill_tool,
@@ -113,6 +118,7 @@ class Registry:
         )
         tools = (
             *builtin_tools(),
+            delegate_tool(),
             *TodoListMiddleware().tools,
             read_skill_tool({}),
             *tools,
@@ -141,6 +147,7 @@ class Registry:
                     "grep_search",
                     "read_file",
                     "write_todos",
+                    "delegate_read",
                     *(("read_skill",) if self.skills else ()),
                 ),
                 skills=tuple(sorted(self.skills)),
@@ -155,6 +162,7 @@ class Registry:
                     "edit_file",
                     "shell",
                     "write_todos",
+                    "delegate_read",
                     *(("read_skill",) if self.skills else ()),
                 ),
                 skills=tuple(sorted(self.skills)),
@@ -186,6 +194,8 @@ class Registry:
         ):
             raise ValueError("Unknown extension profile or validator tool")
         for profile in profiles.values():
+            if "delegate_read" in profile.tools and not set(profile.tools) & READ_TOOLS:
+                raise ValueError("delegate_read requires a workspace read/search tool")
             if (
                 len(profile.skills) != len(set(profile.skills))
                 or set(profile.skills) - self.skills.keys()
@@ -268,6 +278,11 @@ class Registry:
                             }
                         }
                         if set(declaration.tools) & {"write_todos", "read_skill"}
+                        else {}
+                    ),
+                    **(
+                        {"delegation": delegation_manifest()}
+                        if "delegate_read" in declaration.tools
                         else {}
                     ),
                     "tools": sorted(declaration.tools),

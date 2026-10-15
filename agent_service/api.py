@@ -3,9 +3,8 @@ from uuid import UUID
 
 from contracts.v1 import ConversationCreate, RunCreate, RunStatus, TurnCreate
 from fastapi import APIRouter, Header, Query, Request, Response
-from agent_service.trace import encode_trace
+from agent_service.trace import encode_trace, trace_config
 
-from agent_service.runtime import run_config
 from agent_service.storage import public_run
 
 router = APIRouter(prefix="/v1")
@@ -78,11 +77,16 @@ async def timeline(run_id: UUID, request: Request):
 
 
 @router.get("/runs/{run_id}/trace")
-async def trace(run_id: UUID, request: Request, limit: int = Query(50, ge=1, le=200)):
+async def trace(
+    run_id: UUID,
+    request: Request,
+    limit: int = Query(50, ge=1, le=200),
+    namespace: str | None = None,
+):
     row = await db(request).get(run_id)
     checkpoints = []
     async for cp in request.app.state.resources.checkpointer.alist(
-        run_config(run_id), limit=limit
+        trace_config(run_id, namespace), limit=limit
     ):
         checkpoints.append(
             {

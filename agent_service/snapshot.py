@@ -22,9 +22,12 @@ def safe_endpoint(endpoint):
 
 
 def runtime_snapshot(model, settings, registry, binding, middleware):
+    from agent_service.delegation import manifest
+
     profile = registry.resolve(binding)
     return {
         "version": 1,
+        **({"delegation": manifest()} if "delegate_read" in profile.tools else {}),
         "context_policy_version": CONTEXT_VERSION,
         "todo_limits": TODO_LIMITS if "write_todos" in profile.tools else None,
         "visible_skills": [

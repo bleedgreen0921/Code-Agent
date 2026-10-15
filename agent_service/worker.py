@@ -11,7 +11,7 @@ import openai
 import psycopg
 from langchain.agents.middleware.model_call_limit import ModelCallLimitExceededError
 from langchain.agents.middleware.tool_call_limit import ToolCallLimitExceededError
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import HumanMessage
 
 from agent_service.resources import Resources
 from agent_service.execution import ExecutionScope, recover_resources, check_environment
@@ -29,6 +29,15 @@ from agent_service.runtime import (
     build_agent,
     model_from_resources,
     run_config,
+)
+
+from agent_service.delegation import (
+    DelegationController,
+    DelegationDiagnostics,
+    ReportedUsage,
+    delegate_tool,
+    final_text,
+    InvalidFinalText,
 )
 
 log = logging.getLogger(__name__)
@@ -86,6 +95,8 @@ class Worker:
         middleware = (*extension.middleware_factory(), *native_middleware)
         generated = [t for m in middleware for t in getattr(m, "tools", ())]
         names = [t.name for t in generated]
+        if "delegate_read" in names:
+            raise ValueError("delegate_read must be assembled by the Run owner")
         if len(names) != len(set(names)) or set(names) - set(profile.tools):
             raise ValueError("Duplicate or undeclared middleware tools")
         if any(
@@ -94,6 +105,23 @@ class Worker:
             raise ValueError("Middleware tool schema differs from its declaration")
         actual_tools.update({t.name: t for t in generated})
         policy = registry.policy(binding, actual_tools=actual_tools)
+        usage = row["_reported_usage"] = ReportedUsage()
+        if "delegate_read" in profile.tools:
+            controller = DelegationController(
+                model=self.model,
+                checkpointer=self.resources.checkpointer,
+                settings=self.settings,
+                scope=scope,
+                policy=policy,
+                skills=[registry.skills[n] for n in sorted(profile.skills)],
+                system_prompt=profile.system_prompt,
+            )
+            actual_tools["delegate_read"] = delegate_tool(controller)
+            policy = registry.policy(binding, actual_tools=actual_tools)
+            middleware = (
+                *middleware,
+                DelegationDiagnostics(controller, usage, extension.state_schema),
+            )
         snapshot = runtime_snapshot(
             self.model, self.settings, registry, binding, middleware
         )
@@ -142,6 +170,7 @@ class Worker:
         self.agent = graph
         context = RunContext(
             run_id=str(row["id"]),
+            agent_id=str(row["id"]),
             conversation_id=str(row["conversation_id"])
             if row["conversation_id"]
             else None,
@@ -169,6 +198,10 @@ class Worker:
                 or row["conversation_id"] is None
                 or prior["final_checkpoint"].get("configurable", {}).get("thread_id")
                 != str(prior["id"])
+                or prior["final_checkpoint"]
+                .get("configurable", {})
+                .get("checkpoint_ns", "")
+                != ""
             ):
                 raise RuntimeError("Successful predecessor checkpoint required")
             # Read the exact published checkpoint, never the latest intermediate state.
@@ -177,14 +210,18 @@ class Worker:
                 raise RuntimeError("Predecessor final checkpoint unavailable")
             messages = inherited_state(snapshot.values)["messages"]
         config = run_config(row["id"])
+        config["callbacks"] = [row["_reported_usage"]]
         state = await graph.ainvoke(
             {"messages": [*messages, HumanMessage(content=row["task"])]},
             config,
             context=context,
+            durability="sync",
         )
         if scope:
             await scope.healthy()
-        final = await graph.aget_state(config)
+        final = await graph.aget_state(
+            {**config, "configurable": {**config["configurable"], "checkpoint_ns": ""}}
+        )
         if final.next or state.get("__interrupt__"):
             raise IncompleteGraphError(
                 "Graph interrupted; no HTTP resume endpoint is enabled"
@@ -198,12 +235,10 @@ class Worker:
                 sort_keys=True,
             )
         else:
-            last = state["messages"][-1]
-            if not isinstance(last, AIMessage) or last.tool_calls:
-                raise IncompleteGraphError(
-                    "Graph did not produce a final assistant message"
-                )
-            answer = last.text
+            try:
+                answer = final_text(state)
+            except InvalidFinalText as exc:
+                raise IncompleteGraphError(str(exc)) from exc
         if not final.config.get("configurable", {}).get("checkpoint_id"):
             raise RuntimeError("Final checkpoint was not persisted")
         return answer, final.config
@@ -290,6 +325,16 @@ class Worker:
             if not work.done():
                 work.cancel()
             await asyncio.gather(work, return_exceptions=True)
+            if usage := row.get("_reported_usage"):
+                log.info(
+                    "run_reported_usage",
+                    extra={
+                        "run_id": str(row["id"]),
+                        "reported_usage": usage.report(
+                            aborted=not bool(result.get("answer"))
+                        ),
+                    },
+                )
             try:
                 clean = await scope.close() if scope else True
                 if not clean and not result.get("error_code"):
@@ -385,6 +430,8 @@ class JsonFormatter(logging.Formatter):
             "error_code",
             "history_tokens_approx",
             "request_tokens_approx",
+            "reported_usage",
+            "delegation",
         ):
             if hasattr(record, key):
                 payload[key] = getattr(record, key)

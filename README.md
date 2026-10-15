@@ -170,3 +170,27 @@ API 和 Worker 启动时读取不可变技能快照，修改后须同步重启�
 会话唯一继承白名单为 messages：只读取同会话上一成功 Run 发布的明确最终 checkpoint，继承原生摘要和历史工具消息。Todo、计数、业务状态、结构化结果和运行资源每轮重新开始。失败、取消和失租轮次不参与继承。本阶段没有新增表、迁移、详情字段、端点或流式协议。
 
 现有 `/v1/runs/{run_id}/trace` 和 `python -m db.trace_run RUN_UUID` 可查看原生 checkpoint 的 `channel_values.todos` 与工具消息，按配置中的最终 checkpoint_id 定位成功结果。`runtime_config` 记录上下文策略版本、Todo 限制、可见技能及哈希、摘要提示版本；技能正文只进入工具消息，不复制到配置快照。架构与扩展规则见 [架构说明](docs/architecture.md) 和 [运行说明](docs/runtime.md)，本阶段验证见 [阶段三验收](docs/阶段三实施验收.md)。
+
+## 受控只读委派（阶段四）
+
+`workspace_read`、`workspace_write` 默认提供 `delegate_read(task)`，`chat` 继续为空工具。自定义 Profile 必须显式选择 `delegate_read`，并同时选择至少一个 `glob_search`、`grep_search` 或 `read_file`。`task` 包含目标、必要背景和期望结果，非空且最多 8 KiB UTF-8；简单查询可直接调用父工具。
+
+每个 Run 最多实际启动两次、串行、深度一层。每次子图只输入本次 task，不继承父历史、Todo、技能正文或上次子任务状态。子工具取固定读取白名单与父权限的交集，保留父参数校验器和技能白名单，重新创建并绑定真实工具实例；无 Shell、文件写入、Todo、自定义工具或再次委派。父图只收到子图的最终文本或稳定错误码。
+
+委派必须独占一次工具批次；混合批次和同批多个委派均不会启动子图，普通工具继续执行。非法输入、权限拒绝和批次拒绝不消耗启动额度；已经启动的局部失败消耗一次，重复调用 ID 不重放。额度保存在 Run 的服务端对象中，摘要和 Hook 修改诊断状态均不能重置。
+
+父图保留原生 16 次模型/10 次工具限制，委派计入父工具次数；每个子图使用独立原生 8/6 限次。合计最多 32 次主循环模型、22 次工具调用；原生摘要额外调用照常发生，不提供硬 token 配额。子图和父图共享剩余总期限、容器、工作区占用和清理流程；子工具保留 30 秒及 16 KiB/200 行默认限制，整个委派不占工作区命令锁，也不套用命令计时器。读写父容器中的子图只读性来自受控工具与校验，不构成独立只读容器隔离。
+
+子配额耗尽返回 `SUBAGENT_QUOTA_EXCEEDED`；SDK 模型调用失败返回脱敏的 `SUBAGENT_MODEL_FAILED`；无合法最终文本返回 `SUBAGENT_INVALID_OUTPUT`。用尽两次启动额度返回 `SUBAGENT_LIMIT_REACHED`。取消、总超时、失租、工具超时、容器故障、持久化故障、Hook 契约和未知异常终止整个 Run。子 Agent 不创建 Run 或队列任务，不占额外 Worker 槽位，不后台执行；重启只清理、终结异常任务，不续跑子 checkpoint。
+
+原生子 checkpoint 使用同一 thread_id 下框架生成的独立 namespace。父状态 `delegations` 最多保存两条关联摘要，`reported_usage` 保存原生回调聚合值与完整性标记；总量包含父、子及摘要，只取根收集器，缺失报告不视为零。父最终发布与会话继承只接受根 namespace 的明确最终 checkpoint，下一轮仍仅继承 messages。完整过程可通过 trace 查看：
+
+```bash
+# 默认查询所有 namespace；空 namespace 只查询根图。
+python -m db.trace_run RUN_UUID
+python -m db.trace_run RUN_UUID --namespace ''
+python -m db.trace_run RUN_UUID --namespace 'tools:FRAMEWORK_GENERATED_ID'
+curl 'http://127.0.0.1:8000/v1/runs/RUN_UUID/trace?namespace='
+```
+
+数据库继续使用 `core_0003`，本阶段不增加依赖、表或迁移。API 与 Worker 必须同步更新和重启；已有工作区 Profile 的排队绑定变化仍按 `CONFIGURATION_CHANGED` 处理，默认 chat 保持既有绑定。详见 [阶段四验收](docs/阶段四实施验收.md)。

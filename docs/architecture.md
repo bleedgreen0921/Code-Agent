@@ -22,3 +22,11 @@ Worker 每次认领生成新 lease_token，任务只执行一次。续租和最�
 RunContextMiddleware 在每次主模型调用前重建可信运行约束、技能名称/描述目录与当前 Todo，仅修改本次 ModelRequest；摘要只处理原生消息，不保存注入内容。原生 SummarizationMiddleware 继续处理工具调用配对与近期消息。运行配置快照记录上下文/Todo/技能/摘要版本；read_skill 的完整正文作为普通工具消息进入 checkpoint，摘要后可重新读取。
 
 跨轮继承统一经过 messages 白名单和同会话成功最终 checkpoint 检查。历史 Todo/技能工具消息仅为历史，不恢复清单、不扩展技能白名单；其它状态和资源均重新创建。默认 chat 指纹保持兼容，新能力版本仅进入启用这些能力的 Profile 绑定。
+
+阶段四采用[官方工具封装子 Agent 模式](https://docs.langchain.com/oss/python/langchain/multi-agent/subagents)，沿用 `create_agent`、原生 middleware、Command、checkpoint namespace 和报告用量回调。Worker.prepare 按 Run 创建 DelegationController，负责真实启动 ID 的原子预留与串行执行；该对象不进入 checkpoint，诊断状态不是额度权威。父工具生命周期记录原批次与调用 ID，外层 middleware 提前拒绝混合批次，实际委派入口在 Hook 之后再次检查批次、层级和参数。委派不进入 WorkspaceExecutionMiddleware 的工作区锁；内部读取工具仍进入同一父 scope 的锁、健康检查和命令期限。
+
+子图独立实例化文件与技能读取工具，以固定白名单和父策略交集形成实例绑定策略，并复用所选工具的父参数验证器。子 context 沿用实际 run_id、工作区绑定及截止时间，使用新 agent_id、父标识和深度 1。子图不安装父扩展 middleware，不传父 state_schema、response_format 或 BaseStore；只输入一条 HumanMessage。子提示由可信 Profile 提示与固定只读指令构成，运行约束按子权限重新注入。
+
+子调用以 values/checkpoints 流和同步 durability 等待完成，再核对最终 checkpoint 无 next/interrupt、最终 AI 文本合法且明确指针已持久化。成功仅通过 ToolMessage 返回最终文本，Command 将最多两条关联诊断写入父原生状态。局部失败只有原生调用配额、明确 SDK 模型错误、非法最终文本；其它异常沿 await 链外传，父生命周期防止 Hook 吞掉控制错误。Run 取消后冻结父 scope，等待图和本地执行收敛，再使用既有清理和发布流程。
+
+根用量回调只挂一次，随调用链观察父、子、原生摘要；子回调单独记录自身报告，不再加回根聚合。成功汇总写入父状态，异常结束的日志明确标记不完整。trace 直接读原生 checkpointer，支持可选 namespace 精确过滤；默认全部读取。父图发布和跨 Run 继承明确限定根 namespace，子成功状态无法更新会话成功指针。子调用无独立 Run、额外队列/槽位、恢复或进度端点；阶段四仍使用 core_0003。

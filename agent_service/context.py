@@ -57,6 +57,9 @@ class RunContextMiddleware(AgentMiddleware):
         context = {
             "context_policy": CONTEXT_VERSION,
             "profile": getattr(ctx, "profile", "chat"),
+            "agent_id": getattr(ctx, "agent_id", None) or getattr(ctx, "run_id", None),
+            "parent_agent_id": getattr(ctx, "parent_agent_id", None),
+            "agent_depth": getattr(ctx, "agent_depth", 0),
             "workspace_access": access,
             "tools": names,
             "workspace_network": "none",

@@ -319,6 +319,17 @@ class ExecutionScope:
         if self.session:
             await asyncio.to_thread(self.session.stop, 0.2)
         self.shell_processes.clear()
+        # Nested graph cancellation can interrupt DockerClient.call while it reaps
+        # an already killed process. The frozen Run scope owns those remaining
+        # handles and finishes reaping them before releasing workspace occupancy.
+        for proc in list(self.client.processes):
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            await proc.wait()
+            self.client.processes.discard(proc)
         if self.client.processes:
             raise CleanupFailed("Docker client operations remain pending")
 

@@ -45,3 +45,11 @@ Todo 的可信参数验证在最终 Hook 改写后执行；使用框架自身组
 主模型请求组合顺序为原生摘要与限制 → 扩展 Hook/原生 Todo 提示 → 权限与执行中间件 → RunContextMiddleware → 模型调用边界。每次补入可信提示和当前约束、技能目录、Todo；不把这些上下文加入持久消息。history_tokens_approx 仅估算历史，request_tokens_approx 还包含系统与工具 Schema。20000 是摘要触发阈值，不是模型上下文窗口硬上限；6000 保留与 16000 摘要输入裁剪继续遵循原生分段。摘要失败使用既有异常和资源清理路径，不重放工具。
 
 `inherited_state()` 是唯一状态继承入口，白名单固定 messages；只从同会话上一成功 Run 的明确最终 checkpoint 读取。Todo、计数、自定义状态、结构化结果和资源每轮重建。trace 原生 checkpoint.channel_values.todos 可查看进度；runtime_config 仅新增策略版本、Todo 限制、可见技能哈希和摘要提示版本，无技能正文。
+
+阶段四新增 `delegate_read(task)`，内置 workspace_read/workspace_write 默认开启，自定义 Profile 显式启用并至少拥有一种工作区读取/搜索工具。公开参数不接受 Profile、模型、工作区、权限、期限或 checkpoint。`RunContext` 增加默认兼容的 agent_id、parent_agent_id、agent_depth；run_id 始终是资源所属的实际父 Run。`build_agent` 的可信参数 model_call_limit/tool_call_limit 默认为 16/10，子图独立设置为 8/6，服务端固定两次启动与一层深度。
+
+配置指纹和 runtime_config 对启用委派的 Profile 记录实现版本、子提示版本、读取白名单和限次；未启用的 Profile 保持原绑定计算。部署需同步更新 API/Worker，旧排队工作区绑定变化按既有规则拒绝，不新增迁移或依赖。自定义 Profile 示例见 config/runtime.example.toml。
+
+`delegations` 为最多两条原生父状态记录：delegation_id、original_tool_call_id、status、error_code、namespace、final_checkpoint、model_calls、tool_calls 和 reported_usage。失败子图保留中间原生 checkpoint，可按 metadata 中 parent_run_id/delegation_id/original_tool_call_id/agent_depth/delegation_version 追踪；仅成功子图有最终关联指针。reported_usage.models 为模型报告聚合，complete=false 表示缺失报告或异常中止，missing_reports 记录缺失数；不得将缺失用量解释为零。
+
+HTTP `/v1/runs/{run_id}/trace?namespace=...` 与 CLI `python -m db.trace_run RUN_UUID --namespace ...` 精确过滤 namespace，省略读取全部，空字符串读取根。子 namespace 由框架生成，复制实际 trace 值，不自行构造。子 checkpoint 不用于执行恢复，父最终指针和会话继承都限定根 namespace。Run 重启后不恢复父子执行。

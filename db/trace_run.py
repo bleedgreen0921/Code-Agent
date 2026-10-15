@@ -4,11 +4,10 @@ import json
 from uuid import UUID
 
 from agent_service.resources import Resources
-from agent_service.runtime import run_config
-from agent_service.trace import encode_trace
+from agent_service.trace import encode_trace, trace_config
 
 
-async def inspect(run_id):
+async def inspect(run_id, namespace=None):
     async with Resources() as resources:
         row = await resources.store.get(run_id)
         history = [
@@ -18,7 +17,9 @@ async def inspect(run_id):
                 "checkpoint": cp.checkpoint,
                 "pending_writes": cp.pending_writes,
             }
-            async for cp in resources.checkpointer.alist(run_config(run_id))
+            async for cp in resources.checkpointer.alist(
+                trace_config(run_id, namespace)
+            )
         ]
         return {
             "run_id": str(run_id),
@@ -33,9 +34,15 @@ async def inspect(run_id):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("run_id", type=UUID)
+    parser.add_argument(
+        "--namespace", default=None, help="Exact namespace; empty string selects root"
+    )
     args = parser.parse_args()
     print(
-        json.dumps(encode_trace(asyncio.run(inspect(args.run_id))), ensure_ascii=False)
+        json.dumps(
+            encode_trace(asyncio.run(inspect(args.run_id, args.namespace))),
+            ensure_ascii=False,
+        )
     )
 
 
