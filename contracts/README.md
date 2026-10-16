@@ -65,3 +65,7 @@ Run、后台操作、同步外部操作投影增加 `failure_info`，历史值�
 `GET /v1/runs/{id}`、会话轮次详情、`GET /v1/tasks/{id}` 增加 `unresolved`：unknown_operations、unreleased_resources、oldest_age_seconds、reasons、records、truncated。Task 汇总全部 Run，Run 只汇总自身；records 最老优先至多 50 条，计数不受展示截断影响。关联记录只含身份、状态、创建时间、安全原因与计数标志。同步未知不推断为资源占用；同一后台记录可分别计入未知与未释放，但只展示一次。年龄从创建时间计算。详情读取不改变状态。
 
 提交模型、状态集合、答案字段和 HTTP 错误 envelope 保持兼容；没有新增恢复或强制覆盖接口。详细枚举与错误码见 [第一批契约](../docs/第一批异常契约与诊断.md)。
+
+### 可选验证报告（core_0008）
+
+Run 详情、列表和 trace 增加 verification；Task 详情关联 current_run_id 已发布报告。未发布及历史记录为 null，不推断为 passed。报告与 result 在同一事务发布，失败 Run 的 result 仍为 null；报告 checkpoint 仅是候选证据。状态集合、提交请求和错误 envelope 不变，无验证触发/覆盖/重跑接口。可信注册、严格报告及 required 阶段继承语义见[第三批说明](../docs/第三批可信验证与重复错误控制.md)。

@@ -80,6 +80,7 @@ def build_agent(
     skills=(),
     model_call_limit=16,
     tool_call_limit=10,
+    no_progress_enabled=False,
 ):
     from agent_service.delegation import DelegationBatchMiddleware
     from agent_service.mcp_runtime import MCPBatchMiddleware
@@ -101,10 +102,14 @@ def build_agent(
     validators = dict(policy.validators)
     if "write_todos" in policy.tools:
         custom = validators.get("write_todos")
-        validators["write_todos"] = lambda args, ctx: validate_todos(args, ctx) and (
-            custom is None or custom(args, ctx) is not False
+        validators["write_todos"] = lambda args, ctx: (
+            validate_todos(args, ctx)
+            and (custom is None or custom(args, ctx) is not False)
         )
     policy = PermissionPolicy(policy.tools, validators, policy.binding_fingerprint)
+    from agent_service.no_progress import NoProgressMiddleware
+
+    no_progress = NoProgressMiddleware() if no_progress_enabled else None
     return create_agent(
         model=model,
         tools=list(tools),
@@ -115,7 +120,8 @@ def build_agent(
         state_schema=state_schema,
         response_format=response_format,
         middleware=[
-            ToolLifecycleMiddleware(output_limits or (16384, 200)),
+            ToolLifecycleMiddleware(output_limits or (16384, 200), no_progress),
+            *([no_progress] if no_progress else []),
             ModelCallLimitMiddleware(run_limit=model_call_limit, exit_behavior="error"),
             ToolCallLimitMiddleware(run_limit=tool_call_limit, exit_behavior="error"),
             SummarizationMiddleware(

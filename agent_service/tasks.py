@@ -151,7 +151,11 @@ class TaskStore:
     async def task(self, task_id):
         async with self.snapshot() as conn:
             row = await (
-                await conn.execute("SELECT * FROM agent.tasks WHERE id=%s", (task_id,))
+                await conn.execute(
+                    """SELECT t.*,r.verification FROM agent.tasks t
+                    LEFT JOIN agent.runs r ON r.id=t.current_run_id WHERE t.id=%s""",
+                    (task_id,),
+                )
             ).fetchone()
             if not row:
                 raise ApiError(404, ErrorCode.NOT_FOUND, "Task not found")
@@ -335,10 +339,14 @@ class TaskStore:
             if active:
                 continue
             if runs:
-                if unfinished or unreleased:
+                if unfinished or unreleased or run_resources:
                     await self.task_transition(conn, tid, "waiting_background")
                     continue
-                if all(o["consumed_run_id"] for o in ops):
+                from agent_service.verification import message_source_eligible
+
+                if all(o["consumed_run_id"] for o in ops) and message_source_eligible(
+                    runs[-1]
+                ):
                     await self.task_transition(
                         conn, tid, "completed", answer=runs[-1]["answer"]
                     )
@@ -373,14 +381,18 @@ class TaskStore:
                 )
             ).fetchone():
                 continue
-            number = (
-                await (
-                    await conn.execute(
-                        "SELECT COALESCE(max(execution_no),0)+1 AS n FROM agent.runs WHERE task_id=%s",
-                        (task["id"],),
-                    )
-                ).fetchone()
-            )["n"]
+            from agent_service.verification import message_source_eligible
+
+            history = await (
+                await conn.execute(
+                    "SELECT * FROM agent.runs WHERE task_id=%s ORDER BY execution_no DESC",
+                    (task["id"],),
+                )
+            ).fetchall()
+            number = history[0]["execution_no"] + 1 if history else 1
+            previous = next(
+                (r["id"] for r in history if message_source_eligible(r)), None
+            )
             if number > 5:
                 await self.stop_task(conn, task["id"], code="TASK_RUN_LIMIT")
                 continue
@@ -394,7 +406,7 @@ class TaskStore:
                     task["task"],
                     task["id"],
                     number,
-                    task["last_success_run_id"],
+                    previous,
                     task["profile"],
                     task["workspace_id"],
                     Jsonb(task["submitted_binding"]),

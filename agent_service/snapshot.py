@@ -28,6 +28,11 @@ def runtime_snapshot(model, settings, registry, binding, middleware):
     profile = registry.resolve(binding)
     return {
         "version": 1,
+        **(
+            registry.extensions[profile.id].manifest()
+            if profile.id in registry.extensions
+            else {}
+        ),
         "reliability": registry.reliability.model_dump(),
         **(
             {"knowledge": knowledge_manifest()}

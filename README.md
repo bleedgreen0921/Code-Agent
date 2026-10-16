@@ -2,7 +2,7 @@
 
 本机运行的 Agent 执行服务，包含任务 API、异步 Worker 和 PostgreSQL 持久化。执行层使用 LangChain `create_agent`、原生消息状态、PostgreSQL Checkpointer 和摘要中间件。提供空工具聊天、容器内工作区搜索读取和文件修改/Shell 三种内置 Profile，并支持 Todo、Skills、受控只读委派、人工管理的项目知识、静态授权 MCP 工具，以及独立持久 Task 与后台操作。所有工作区工具在 Docker 中运行，直接修改注册目录。
 
-基础增强阶段 1～6 已全部实施，当前数据库版本为 `core_0005`。最新阶段六验收记录为 245 项测试、零失败/错误/跳过；测试使用合成模型，实际模型任务效果需单独评估。各阶段交付、验收和暂缓能力见 [基础增强路线图](docs/基础架构增强路线图.md)。
+基础增强阶段 1～6 及三批异常、可靠性与可信验证增强已实施，当前数据库版本为 `core_0008`。最新行为与验收见[第三批说明](docs/第三批可信验证与重复错误控制.md)和[独立验收记录](docs/第三批可信验证与重复错误控制验收.md)。测试使用合成模型，实际模型任务效果需单独评估；原阶段路线见[基础增强路线图](docs/基础架构增强路线图.md)。
 
 ## 安装与初始化
 
@@ -18,7 +18,7 @@ export AGENT_DATABASE_URL='postgresql://agent_runtime:RUNTIME_PASSWORD@127.0.0.1
 .venv/bin/python -m db.doctor --json
 ```
 
-请预先创建空数据库。迁移 owner 需要创建表；bootstrap 还需要创建运行角色的权限。运行角色必须与 owner 分离，无 schema、数据库创建权或 revision 写权限。迁移通过单条 Alembic 链 `core_0001 → core_0002 → core_0003 → core_0004 → core_0005` 创建/升级核心表，版本权威为 `agent.alembic_version`，并调用框架 Checkpointer 和 PostgreSQL Store 的 `setup()`；重复执行安全，API/Worker 不执行 DDL。
+请预先创建空数据库。迁移 owner 需要创建表；bootstrap 还需要创建运行角色的权限。运行角色必须与 owner 分离，无 schema、数据库创建权或 revision 写权限。迁移通过单条 Alembic 链 `core_0001 → core_0002 → core_0003 → core_0004 → core_0005 → core_0006 → core_0007 → core_0008` 创建/升级核心表，版本权威为 `agent.alembic_version`，并调用框架 Checkpointer 和 PostgreSQL Store 的 `setup()`；重复执行安全，API/Worker 不执行 DDL。
 
 迁移接受空库、结构匹配的当前 `agent_core_0001` 核心库及已知 Alembic revision。旧核心库先经只读结构/标识校验，再登记 core_0001 并升级；历史会话与 Run 回填 chat 绑定，历史模型配置保持 null。旧业务 schema、未知 revision、未知非空库、结构不匹配库在任何 DDL 和权限修改前拒绝。checkpoint 表继续由框架维护。
 
@@ -197,7 +197,7 @@ python -m db.trace_run RUN_UUID --namespace 'tools:FRAMEWORK_GENERATED_ID'
 curl 'http://127.0.0.1:8002/v1/runs/RUN_UUID/trace?namespace='
 ```
 
-只读委派在阶段四未增加依赖、表或迁移，当时数据库版本为 `core_0003`；当前部署统一升级到 `core_0007`。API 与 Worker 必须同步更新和重启；已有工作区 Profile 的排队绑定变化仍按 `CONFIGURATION_CHANGED` 处理，第二批期限策略进入 chat 绑定，历史绑定仍保留。详见 [阶段四验收](docs/阶段四实施验收.md)。
+只读委派在阶段四未增加依赖、表或迁移，当时数据库版本为 `core_0003`；当前部署统一升级到 `core_0008`。API 与 Worker 必须同步更新和重启；已有工作区 Profile 的排队绑定变化仍按 `CONFIGURATION_CHANGED` 处理，第二批期限策略进入 chat 绑定，历史绑定仍保留。详见 [阶段四验收](docs/阶段四实施验收.md)。
 
 
 ## 项目知识与 MCP（阶段五）
@@ -206,14 +206,14 @@ curl 'http://127.0.0.1:8002/v1/runs/RUN_UUID/trace?namespace='
 
 静态 `[mcp]` 声明 HTTP 服务、本地 tools/list 目录、凭据环境变量引用和 read/write 分类，Profile.tools 显式选择稳定别名；三个内置 Profile 不自动获得 MCP。同步 MCP 工具由 Worker 使用原生 MCPAdapter，每 Run 独立连接和契约核验；写调用独占批次、先记录派发，未知结果终止 Run，不重发请求。知识或 MCP 单独使用均无需 Docker，已有工作区容器继续无网络。
 
-阶段五通过 `core_0004` 增加外部写入审计并初始化原生 Store；当前部署须迁移到 `core_0007` 并重新 bootstrap，API/Worker 不执行 DDL。配置、完整 API、目录导出、凭据配置和外部结果核对见 [项目知识与外部工具](docs/项目知识与外部工具.md)，验收证据见 [阶段五验收](docs/阶段五实施验收.md)。
+阶段五通过 `core_0004` 增加外部写入审计并初始化原生 Store；当前部署须迁移到 `core_0008` 并重新 bootstrap，API/Worker 不执行 DDL。配置、完整 API、目录导出、凭据配置和外部结果核对见 [项目知识与外部工具](docs/项目知识与外部工具.md)，验收证据见 [阶段五验收](docs/阶段五实施验收.md)。
 
 
 ## 持久任务与后台操作
 
 `POST /v1/tasks` 创建独立 Task，固定目标、Profile、工作区与前置依赖。后台命令和原生 MCP Tasks 立即启动；Run 发布阶段报告后释放执行槽。Worker 重启核对已有资源，后台结果若未被成功 Run 消费，在操作结束并确认清理后创建唯一续 Run。当前 Task 在本地后台执行期间可读取和只读委派，文件可能变化；写入和普通 Shell 被禁止。未知结果失败且不自动重试，外部副作用无法撤回。
 
-阶段六引入 core_0005；当前部署升级 core_0007、重新 bootstrap 并构建新执行镜像。显式选择配置示例的 task-workspace Profile；内置 Profile 不增加后台工具。API、默认限额、状态和故障核对见 [持久任务与后台操作](docs/持久任务与后台操作.md)。
+阶段六引入 core_0005；当前部署升级 core_0008、重新 bootstrap 并构建新执行镜像。显式选择配置示例的 task-workspace Profile；内置 Profile 不增加后台工具。API、默认限额、状态和故障核对见 [持久任务与后台操作](docs/持久任务与后台操作.md)。
 
 
 ## 第一批：异常契约与诊断
@@ -224,4 +224,8 @@ curl 'http://127.0.0.1:8002/v1/runs/RUN_UUID/trace?namespace='
 
 部署顺序为停止旧 API/Worker → owner 执行 `python -m db.migrate` → `python -m db.bootstrap` → `python -m db.doctor --json` → 启动新进程。运行角色无需增加权限。第一批不增加重试、自动重放、恢复接口或工作区回滚。完整字段、状态规则及边界见 [异常契约与诊断](docs/第一批异常契约与诊断.md)，验证证据见 [独立验收记录](docs/第一批异常契约与诊断验收.md)。
 
-第二批当前数据库版本为 `core_0007`，增加跨 Worker 的观察预算、远程间隔和取消尝试/确认，执行提前为清理与发布预留时间；维护中断不延长租约授权。详见[第二批行为说明](docs/第二批后台核对与清理可靠性.md)与[验收记录](docs/第二批后台核对与清理可靠性验收.md)。
+第二批数据库版本为 `core_0007`，增加跨 Worker 的观察预算、远程间隔和取消尝试/确认，执行提前为清理与发布预留时间；维护中断不延长租约授权。详见[第二批行为说明](docs/第二批后台核对与清理可靠性.md)与[验收记录](docs/第二批后台核对与清理可靠性验收.md)。
+
+## 第三批可信验证与重复错误控制
+
+core_0008 仅新增可空的 Run verification 报告。可信 Extension 可注册异步验证器，选择 report 或 required，并显式开启默认关闭的重复错误 middleware。验证在明确最终 checkpoint 后、清理前执行，报告与结果在原事务中发布。required 阶段消息不继承、后台结果不提前消费；历史 null 不代表验证通过。无新增模型调用、验证重试或修复循环。详见[行为与注册示例](docs/第三批可信验证与重复错误控制.md)及[验收](docs/第三批可信验证与重复错误控制验收.md)。

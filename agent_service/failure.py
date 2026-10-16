@@ -62,6 +62,22 @@ def _register(codes, category, effect, recovery, message):
 
 
 _register(
+    "VERIFICATION_FAILED VERIFICATION_INCONCLUSIVE VERIFICATION_CONTRACT_ERROR VERIFICATION_EXECUTION_FAILED",
+    "verification",
+    "not_applicable",
+    "stop",
+    "Completion verification did not pass.",
+)
+_register(
+    "NO_PROGRESS SUBAGENT_NO_PROGRESS",
+    "execution",
+    "not_applicable",
+    "stop",
+    "Repeated correctable tool failures prevented progress.",
+)
+
+
+_register(
     "INVALID_TOOL_ARGUMENTS FILE_ARGUMENTS_INVALID",
     "parameter",
     "not_dispatched",

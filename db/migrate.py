@@ -13,7 +13,7 @@ from psycopg.rows import dict_row
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
-VERSION = "core_0007"
+VERSION = "core_0008"
 STORE_TABLES = {"store", "store_migrations"}
 CORE_TABLES = {"schema_version", "conversations", "runs", "events", "workers"}
 CHECKPOINT_TABLES = {
@@ -110,6 +110,7 @@ def validate_database(conn):
             [("core_0005",)],
             [("core_0006",)],
             [("core_0007",)],
+            [("core_0008",)],
         ]:
             raise RuntimeError("Unknown revision rejected without modification")
         revision = revisions[0][0]

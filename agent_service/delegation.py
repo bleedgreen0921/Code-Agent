@@ -5,6 +5,8 @@ import json
 import logging
 from dataclasses import replace
 from uuid import uuid4
+from agent_service.no_progress import NoProgress
+from agent_service.failure import failure_info
 from typing import Annotated, Any
 
 import openai
@@ -79,12 +81,16 @@ def error_message(code, call_id):
                     "SUBAGENT_QUOTA_EXCEEDED": "The subagent exhausted its call quota.",
                     "SUBAGENT_MODEL_FAILED": "The subagent model request failed.",
                     "SUBAGENT_INVALID_OUTPUT": "The subagent did not produce valid final text.",
+                    "SUBAGENT_NO_PROGRESS": "The subagent repeated the same correctable tool failure.",
                 }[code],
             }
         ),
         name="delegate_read",
         tool_call_id=call_id,
         status="error",
+        artifact={"failure_info": failure_info(code)}
+        if code == "SUBAGENT_NO_PROGRESS"
+        else None,
     )
 
 
@@ -223,10 +229,12 @@ class DelegationController:
         policy,
         skills=(),
         system_prompt=None,
+        no_progress_enabled=False,
     ):
         self.model, self.checkpointer, self.settings = model, checkpointer, settings
         self.scope, self.policy, self.skills = scope, policy, tuple(skills)
         self.system_prompt = system_prompt
+        self.no_progress_enabled = no_progress_enabled
         self.started = set()
         self.lock = asyncio.Lock()
         self.records = []
@@ -259,6 +267,7 @@ class DelegationController:
             skills=self.skills,
             model_call_limit=LIMITS["model_calls"],
             tool_call_limit=LIMITS["tool_calls"],
+            no_progress_enabled=self.no_progress_enabled,
             execution_middleware=[
                 WorkspaceExecutionMiddleware(self.scope, names & READ_TOOLS)
             ],
@@ -368,6 +377,8 @@ class DelegationController:
             code = "SUBAGENT_MODEL_FAILED"
         except InvalidFinalText:
             code = "SUBAGENT_INVALID_OUTPUT"
+        except NoProgress:
+            code = "SUBAGENT_NO_PROGRESS"
         except BaseException:
             log.info(
                 "delegation_aborted",
@@ -394,6 +405,14 @@ class DelegationController:
                 "final_checkpoint": checkpoint["config"]
                 if checkpoint and not code
                 else None,
+                **(
+                    {
+                        "last_checkpoint": checkpoint["config"] if checkpoint else None,
+                        "failure_info": failure_info("SUBAGENT_NO_PROGRESS"),
+                    }
+                    if code == "SUBAGENT_NO_PROGRESS"
+                    else {}
+                ),
                 "model_calls": state.get("thread_model_call_count", 0),
                 "tool_calls": state.get("thread_tool_call_count", {}),
                 "reported_usage": usage.report(),

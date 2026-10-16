@@ -44,6 +44,20 @@ class Call:
     violation: BaseException | None = None
     failure: BaseException | None = None
     diagnostic: dict | None = None
+    trusted_code: str | None = None
+    trusted_fingerprint: str | None = None
+    final_arguments: object = None
+
+
+def mark_correctable(code):
+    from agent_service.no_progress import argument_fingerprint
+
+    call = active_call.get()
+    if call:
+        call.trusted_code = code
+        call.trusted_fingerprint = argument_fingerprint(
+            call.name, call.final_arguments, code
+        )
 
 
 active_call = ContextVar("active_tool_call", default=None)
@@ -51,19 +65,27 @@ active_model_call = ContextVar("active_model_call", default=None)
 
 
 class ToolLifecycleMiddleware(AgentMiddleware):
-    def __init__(self, output_limits=None):
+    def __init__(self, output_limits=None, no_progress=None):
         self.output_limits = output_limits
         self.batches = {}
+        self.no_progress = no_progress
 
     @staticmethod
     def batch_key(context):
         return (getattr(context, "run_id", None), getattr(context, "agent_id", None))
+
+    async def abefore_model(self, state, runtime):
+        authority = getattr(runtime.context, "execution_authority", None)
+        if authority and authority.get("_agent_closed"):
+            raise HookContractError("Agent actions have closed")
 
     async def aafter_model(self, state, runtime):
         # First middleware's after_model runs last, before concurrent tool tasks.
         # Capture once here: sibling tool Hooks may mutate shared message state.
         messages = state.get("messages", [])
         calls = getattr(messages[-1], "tool_calls", ()) if messages else ()
+        if self.no_progress:
+            self.no_progress.batch(calls)
         self.batches[self.batch_key(runtime.context)] = tuple(
             MappingProxyType({"name": c["name"], "id": c["id"]}) for c in calls
         )
@@ -205,6 +227,8 @@ class ToolLifecycleMiddleware(AgentMiddleware):
             error_code = exception_code(exc)
             raise
         finally:
+            if self.no_progress:
+                self.no_progress.record(call)
             active_call.reset(token)
             try:
                 log.info(
@@ -254,10 +278,17 @@ class PermissionMiddleware(AgentMiddleware):
 
         try:
             remaining_execution(call.context)
+            authority = getattr(call.context, "execution_authority", None)
+            if authority and authority.get("_agent_closed"):
+                call.violation = HookContractError("Agent actions have closed")
+                raise call.violation
         except TimeoutError as exc:
             call.failure = exc
             raise
         call.name = request.tool_call["name"]
+        # Retain only the active request reference, never an argument ledger. The
+        # fixed conflict boundary does not mutate it; normalization can safely opt out.
+        call.final_arguments = request.tool_call["args"]
         policy = self.policy
         denied = (
             policy.tools.get(call.name) is not request.tool
@@ -275,6 +306,7 @@ class PermissionMiddleware(AgentMiddleware):
                         deepcopy(request.tool_call["args"])
                     )
                 except Exception:
+                    mark_correctable("INVALID_TOOL_ARGUMENTS")
                     return ToolMessage(
                         content='{"code":"INVALID_TOOL_ARGUMENTS","message":"Arguments do not match the tool schema."}',
                         tool_call_id=call.call_id,
@@ -297,6 +329,7 @@ class PermissionMiddleware(AgentMiddleware):
                         else schema.model_validate(request.tool_call["args"])
                     )
                 except ValidationError:
+                    mark_correctable("INVALID_TOOL_ARGUMENTS")
                     call.diagnostic = failure_info("INVALID_TOOL_ARGUMENTS")
                     parsed = None
                 if parsed is not None:
@@ -307,6 +340,7 @@ class PermissionMiddleware(AgentMiddleware):
             call.failure = exc
             raise
         if denied:
+            mark_correctable("PERMISSION_DENIED")
             return ToolMessage(
                 content='{"code":"PERMISSION_DENIED","message":"Tool or arguments are not permitted for this run."}',
                 tool_call_id=call.call_id,
@@ -322,6 +356,7 @@ class PermissionMiddleware(AgentMiddleware):
             try:
                 request.tool.tool_call_schema.model_validate(request.tool_call["args"])
             except ValidationError:
+                mark_correctable("INVALID_TOOL_ARGUMENTS")
                 call.diagnostic = failure_info("INVALID_TOOL_ARGUMENTS")
         try:
             return await handler(request)

@@ -27,6 +27,7 @@ async def inspect(run_id, namespace=None):
             "submitted_binding": row["submitted_binding"],
             "runtime_config": row["runtime_config"],
             "final_checkpoint": row["final_checkpoint"],
+            "verification": row["verification"],
             "external_operations": await resources.store.external_operations(run_id),
             "history": history,
         }

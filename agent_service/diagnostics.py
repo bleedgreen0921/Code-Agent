@@ -6,6 +6,52 @@ from agent_service.failure import SPECS
 
 
 class DiagnosticStore:
+    async def verification_candidate(self, run_id, delivered=(), *, conn=None):
+        """One read-only snapshot; current Run resources are cleaned after verification."""
+        if conn is None:
+            async with self.snapshot() as snapshot:
+                return await self.verification_candidate(
+                    run_id, delivered, conn=snapshot
+                )
+        from agent_service.external_operations import ExternalFailure
+
+        facts = await (
+            await conn.execute(
+                """
+            SELECT r.*, t.status AS task_status, t.error_code AS task_error,
+                r.lease_until>clock_timestamp() AND r.deadline_at>clock_timestamp() AS live,
+                EXISTS(SELECT 1 FROM agent.external_operations o JOIN agent.runs s ON s.id=o.run_id
+                    WHERE (s.id=r.id OR (r.task_id IS NOT NULL AND s.task_id=r.task_id))
+                    AND o.state IN ('unknown','dispatched')) AS external_unknown,
+                EXISTS(SELECT 1 FROM agent.background_operations o WHERE o.task_id=r.task_id
+                    AND o.state='unknown') AS background_unknown,
+                EXISTS(SELECT 1 FROM agent.execution_resources e JOIN agent.runs s ON s.id=e.run_id
+                    WHERE e.run_id<>r.id AND e.state<>'released' AND
+                    (s.task_id=r.task_id OR s.submitted_binding->>'workspace_identity'=r.submitted_binding->>'workspace_identity'
+                     OR EXISTS(SELECT 1 FROM agent.execution_resources own WHERE own.run_id=r.id AND
+                        (starts_with(e.workspace_root,own.workspace_root||'/')
+                         OR starts_with(own.workspace_root,e.workspace_root||'/')
+                         OR own.workspace_root='/' OR e.workspace_root='/')))) AS old_resources,
+                EXISTS(SELECT 1 FROM agent.background_operations o WHERE o.task_id=r.task_id AND
+                    (o.state NOT IN ('succeeded','failed','cancelled') OR o.cleanup_state<>'released'
+                     OR (o.consumed_run_id IS NULL AND NOT o.id=ANY(%s::uuid[])))) AS pending
+            FROM agent.runs r LEFT JOIN agent.tasks t ON t.id=r.task_id WHERE r.id=%s
+        """,
+                (list(delivered), run_id),
+            )
+        ).fetchone()
+        if facts["status"] != "running" or not facts["live"]:
+            raise ExternalFailure("LEASE_EXPIRED")
+        if facts["task_status"] in ("failed", "cancelled", "cancelling", "completed"):
+            raise ExternalFailure(facts["task_error"] or "WORKER_STOPPED")
+        if facts["external_unknown"] or facts["background_unknown"]:
+            raise ExternalFailure(
+                "MCP_RESULT_UNKNOWN"
+                if facts["external_unknown"]
+                else "BACKGROUND_RESULT_UNKNOWN"
+            )
+        return not (facts["old_resources"] or facts["pending"])
+
     @asynccontextmanager
     async def snapshot(self):
         async with self.pool.connection() as conn, conn.transaction():

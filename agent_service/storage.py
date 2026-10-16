@@ -39,7 +39,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
             revisions = await (
                 await conn.execute("SELECT version_num FROM agent.alembic_version")
             ).fetchall()
-            if revisions != [{"version_num": "core_0007"}]:
+            if revisions != [{"version_num": "core_0008"}]:
                 raise RuntimeError("Core database baseline required")
             await conn.execute("SELECT 1 FROM agent.checkpoints LIMIT 1")
             await conn.execute("SELECT 1 FROM agent.store LIMIT 1")
@@ -55,7 +55,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
                     signature[key] = [list(r.values()) for r in rows]
             if (
                 signature
-                != json.loads((ROOT / "structure.json").read_text())["core_0007"]
+                != json.loads((ROOT / "structure.json").read_text())["core_0008"]
             ):
                 raise RuntimeError("Core structure mismatch")
             from langgraph.store.postgres import PostgresStore
@@ -642,6 +642,9 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
         failure_info=None,
         cancelled=False,
         delivered=(),
+        verification=None,
+        candidate_answer=None,
+        candidate_checkpoint=None,
     ):
         async with self.locked() as conn:
             await self.sweep(conn)
@@ -655,6 +658,20 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
                 "cancelling",
             ):
                 return False
+            from agent_service.verification import (
+                validate_publication,
+                message_source_eligible,
+            )
+
+            if verification is not None:
+                verification = validate_publication(
+                    verification,
+                    row,
+                    candidate_answer if candidate_answer is not None else answer,
+                    candidate_checkpoint
+                    if candidate_checkpoint is not None
+                    else checkpoint,
+                )
             task_failure = None
             if row.get("task_id"):
                 task_failure = await (
@@ -687,7 +704,33 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
                 ).fetchone()
                 if occupied:
                     return False
+                config = row["submitted_binding"].get("verification")
+                if config:
+                    verification = validate_publication(
+                        verification, row, answer, checkpoint
+                    )
+                    from agent_service.execution_errors import ExecutionFailure
+
+                    try:
+                        final_now = await self.verification_candidate(
+                            run_id, delivered, conn=conn
+                        )
+                    except ExecutionFailure as exc:
+                        error_code, final_now = exc.code, False
+                    if (
+                        not error_code
+                        and config["mode"] == "required"
+                        and verification["final_candidate"]
+                    ):
+                        if verification["status"] != "passed" or not final_now:
+                            error_code = (
+                                "VERIFICATION_FAILED"
+                                if verification["status"] == "failed"
+                                else "VERIFICATION_INCONCLUSIVE"
+                            )
                 status = "completed"
+                if error_code:
+                    status, answer, checkpoint = "failed", None, None
             from agent_service.failure import failure_info as describe_failure
 
             info = (
@@ -699,7 +742,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
             )
             published = await (
                 await conn.execute(
-                    """UPDATE agent.runs SET status=%s,answer=%s,final_checkpoint=%s,error_code=%s,failure_info=%s,
+                    """UPDATE agent.runs SET status=%s,answer=%s,final_checkpoint=%s,error_code=%s,failure_info=%s,verification=%s,
                 finished_at=clock_timestamp() WHERE id=%s AND lease_token=%s
                 AND status IN ('running','cancelling') AND lease_until>clock_timestamp()
                 AND deadline_at>clock_timestamp() RETURNING id""",
@@ -709,6 +752,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
                         Jsonb(checkpoint) if checkpoint is not None else None,
                         error_code,
                         Jsonb(info) if info else None,
+                        Jsonb(verification) if verification is not None else None,
                         run_id,
                         token,
                     ),
@@ -717,12 +761,21 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
             if not published:
                 await self.sweep(conn)
                 return False
-            if status == "completed" and row["conversation_id"]:
+            eligible = message_source_eligible(
+                {
+                    **row,
+                    "status": status,
+                    "verification": verification,
+                    "answer": answer,
+                    "final_checkpoint": checkpoint,
+                }
+            )
+            if eligible and row["conversation_id"]:
                 await conn.execute(
                     "UPDATE agent.conversations SET last_success_run_id=%s WHERE id=%s",
                     (run_id, row["conversation_id"]),
                 )
-            if row.get("task_id") and status == "completed":
+            if row.get("task_id") and eligible:
                 await conn.execute(
                     "UPDATE agent.tasks SET last_success_run_id=%s WHERE id=%s",
                     (run_id, row["task_id"]),
@@ -803,6 +856,7 @@ def public_run(row):
             "finished_at",
             "error_code",
             "failure_info",
+            "verification",
         )
     } | {
         "run_id": str(row["id"]),

@@ -5,6 +5,7 @@ import json
 import logging
 import signal
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 
@@ -24,6 +25,7 @@ from agent_service.context import inherited_state
 from agent_service.skills import read_skill_tool
 from langchain.agents.middleware import TodoListMiddleware
 from agent_service.snapshot import runtime_snapshot
+from agent_service.verification import message_source_eligible
 from agent_service.runtime import (
     RunContext,
     build_agent,
@@ -49,6 +51,22 @@ class MaintenanceBudgetExpired(TimeoutError):
 
 class IncompleteGraphError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    answer: str
+    checkpoint: dict
+    verification: dict | None = None
+    error_code: str | None = None
+
+    def publication(self):
+        return {
+            "answer": self.answer,
+            "checkpoint": self.checkpoint,
+            "verification": self.verification,
+            "error_code": self.error_code,
+        }
 
 
 class Worker:
@@ -153,6 +171,7 @@ class Worker:
                 policy=policy,
                 skills=[registry.skills[n] for n in sorted(profile.skills)],
                 system_prompt=profile.system_prompt,
+                no_progress_enabled=extension.no_progress_enabled,
             )
             actual_tools["delegate_read"] = delegate_tool(controller)
             policy = registry.policy(binding, actual_tools=actual_tools)
@@ -204,6 +223,7 @@ class Worker:
                 registry.execution.output_lines,
             ),
             skills=[registry.skills[n] for n in sorted(profile.skills)],
+            no_progress_enabled=extension.no_progress_enabled,
         )
         self.agent = graph
         context = RunContext(
@@ -234,12 +254,14 @@ class Worker:
     async def generate(self, row, scope=None):
         remaining_execution(row)
         graph, context = await self.prepare(row, scope)
+        row["_verification_context"] = context
         remaining_execution(context)
         messages = []
         if row["previous_run_id"]:
             prior = await self.db.get(row["previous_run_id"])
             if (
                 prior["status"] != "completed"
+                or not message_source_eligible(prior)
                 or not prior["final_checkpoint"]
                 or not prior["final_checkpoint"]
                 .get("configurable", {})
@@ -321,24 +343,50 @@ class Worker:
             raise RuntimeError("Final checkpoint was not persisted")
         return answer, final.config
 
+    async def generate_and_verify(self, row, scope):
+        from agent_service.verification import verify
+
+        answer, checkpoint = await self.generate(row, scope)
+        row["_agent_closed"] = True
+        row["_candidate_answer"], row["_candidate_checkpoint"] = answer, checkpoint
+        context = row.get("_verification_context")
+        report, error = await verify(
+            row, self.resources.registry, self.db, context, scope, answer, checkpoint
+        )
+        row["_verification"] = report
+        return ExecutionResult(answer, checkpoint, report, error)
+
     async def publish(self, row, **result):
         """Only retry publication. An uncertain commit never causes model/tool replay."""
         if result.get("error_code") and "failure_info" not in result:
             result["failure_info"] = failure_info(result["error_code"])
         for attempt in range(3):
             try:
-                return await self.db.finish(
+                confirmed = await self.db.finish(
                     row["id"],
                     row["lease_token"],
                     delivered=row.get("_delivered", ()),
                     **result,
                 )
+                if not confirmed:
+                    current = await self.db.get(row["id"])
+                    if current["status"] in ("completed", "failed", "cancelled"):
+                        from agent_service.verification import publication_matches
+
+                        return current["lease_token"] == row[
+                            "lease_token"
+                        ] and publication_matches(current, result)
+                return confirmed
             except (psycopg.Error, OSError, TimeoutError):
                 # A commit acknowledgement may be lost after the transaction committed.
                 try:
                     current = await self.db.get(row["id"])
                     if current["status"] in ("completed", "failed", "cancelled"):
-                        return current["status"] == "completed"
+                        from agent_service.verification import publication_matches
+
+                        return current["lease_token"] == row[
+                            "lease_token"
+                        ] and publication_matches(current, result)
                 except (psycopg.Error, OSError, TimeoutError):
                     pass
                 if attempt == 2:
@@ -375,7 +423,7 @@ class Worker:
             seconds=cleanup_budget + publication_reserve
         )
         row["_lease_until"] = row["lease_until"]
-        work = asyncio.create_task(self.generate(row, scope))
+        work = asyncio.create_task(self.generate_and_verify(row, scope))
         lost = False
         cancelled = False
         shutdown = False
@@ -438,8 +486,8 @@ class Worker:
             if lost or cancelled:
                 pass
             elif work in done:
-                answer, checkpoint = await work
-                result = {"answer": answer, "checkpoint": checkpoint}
+                outcome = await work
+                result = outcome.publication()
             else:
                 result = {"error_code": "RUN_TIMEOUT"}
         except asyncio.CancelledError:
@@ -509,7 +557,7 @@ class Worker:
                 clean = await close_resource(scope)
                 clean = clean and mcp_clean and graph_stopped
                 if not clean and not result.get("error_code"):
-                    result = {"error_code": "RESOURCE_CLEANUP_FAILED"}
+                    result["error_code"] = "RESOURCE_CLEANUP_FAILED"
                 if lost:
                     # Publish no result, but allow the existing DB expiry rules to
                     # close the Run when maintenance is available in this process.
@@ -532,8 +580,18 @@ class Worker:
                     )
                     try:
                         async with asyncio.timeout(seconds):
+                            if row.get("_verification"):
+                                result.update(
+                                    verification=row["_verification"],
+                                    candidate_answer=row["_candidate_answer"],
+                                    candidate_checkpoint=row["_candidate_checkpoint"],
+                                )
                             await self.publish(
-                                row, **({"cancelled": True} if cancelled else result)
+                                row,
+                                **{
+                                    **result,
+                                    **({"cancelled": True} if cancelled else {}),
+                                },
                             )
                     except TimeoutError:
                         log.error(

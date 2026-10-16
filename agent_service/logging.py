@@ -21,6 +21,8 @@ FIELDS = (
     "next_observation_at",
     "recovery_phase",
     "cancel_acknowledged",
+    "verification_mode",
+    "repetition_count",
 )
 STATS = (
     "history_tokens_approx",
@@ -31,6 +33,12 @@ STATS = (
 EVENTS = frozenset(
     "tool_call_started tool_call_finished run_transition task_transition background_transition run_context_budget run_context_prepared model_context delegation_aborted result_publication_unconfirmed lease_renewal_unconfirmed run_execution_failed run_reported_usage execution_environment_preflight_failed background_diagnostic_unconfirmed background_monitor_release_unconfirmed background_observation_retry background_observation_stopped background_cancel_confirmed run_cleanup_unconfirmed worker_maintenance_retry worker_maintenance_exhausted".split()
 )
+EVENTS = EVENTS | {
+    "verification_started",
+    "verification_finished",
+    "verification_failed",
+    "no_progress_observed",
+}
 
 
 def text(value):

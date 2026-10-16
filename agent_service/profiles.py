@@ -1,7 +1,9 @@
 """Startup-only declarations and trusted Python extension points."""
 
 import hashlib
+import inspect
 import json
+import math
 import os
 import tomllib
 from collections.abc import Callable, Mapping
@@ -100,6 +102,64 @@ class Extension:
     middleware_factory: Callable = lambda: ()
     state_schema: Any = None
     response_format: Any = None
+    verification_mode: Literal["report", "required"] | None = None
+    verifier: Callable | None = None
+    verification_timeout: float = 10.0
+    no_progress_enabled: bool = False
+
+    def __post_init__(self):
+        if (
+            type(self.version) is not str
+            or not self.version
+            or "\x00" in self.version
+            or len(self.version.encode()) > 128
+        ):
+            raise ValueError("Extension version must be a bounded nonempty string")
+        if self.verification_mode not in (None, "report", "required"):
+            raise ValueError("Invalid verification mode")
+        if (
+            type(self.verification_timeout) not in (int, float)
+            or not math.isfinite(self.verification_timeout)
+            or self.verification_timeout <= 0
+        ):
+            raise ValueError("Verification timeout must be finite and positive")
+        if type(self.no_progress_enabled) is not bool:
+            raise ValueError("no_progress_enabled must be a boolean")
+        if self.verifier is not None:
+            target = self.verifier
+            if not callable(target) or not (
+                inspect.iscoroutinefunction(target)
+                or inspect.iscoroutinefunction(getattr(target, "__call__", None))
+            ):
+                raise ValueError("Verifier must be an async callable")
+            try:
+                inspect.signature(target).bind(None, "", None)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Verifier must accept context, answer, checkpoint"
+                ) from exc
+        if self.verification_mode == "required" and self.verifier is None:
+            raise ValueError("required verification needs a registered verifier")
+
+    def manifest(self):
+        from agent_service.no_progress import manifest
+
+        return {
+            **(
+                {
+                    "verification": {
+                        "version": 1,
+                        "mode": self.verification_mode,
+                        "timeout": self.verification_timeout,
+                        "verifier_registered": self.verifier is not None,
+                        "extension_version": self.version,
+                    }
+                }
+                if self.verification_mode
+                else {}
+            ),
+            **({"no_progress": manifest()} if self.no_progress_enabled else {}),
+        }
 
 
 class ConfigurationChanged(RuntimeError):
@@ -147,10 +207,12 @@ class Registry:
             raise ValueError("Duplicate tool names")
         custom_validators = dict(validators or {})
         extra_todo_validator = custom_validators.get("write_todos")
-        custom_validators["write_todos"] = lambda args, ctx: validate_todos(
-            args, ctx
-        ) and (
-            extra_todo_validator is None or extra_todo_validator(args, ctx) is not False
+        custom_validators["write_todos"] = lambda args, ctx: (
+            validate_todos(args, ctx)
+            and (
+                extra_todo_validator is None
+                or extra_todo_validator(args, ctx) is not False
+            )
         )
         self.validators = MappingProxyType(custom_validators)
         self.extensions = MappingProxyType(dict(extensions or {}))
@@ -282,6 +344,7 @@ class Registry:
         }
         payload = {
             "version": 1,
+            **self.extensions.get(profile, Extension()).manifest(),
             "profile": profile,
             "profile_fingerprint": fingerprint(
                 {
@@ -350,6 +413,7 @@ class Registry:
                         else {}
                     ),
                     "reliability": self.reliability.model_dump(),
+                    **self.extensions.get(profile, Extension()).manifest(),
                     "tools": sorted(declaration.tools),
                     "extension_version": self.extensions.get(
                         profile, Extension()
