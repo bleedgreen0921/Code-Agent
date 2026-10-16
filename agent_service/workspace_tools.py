@@ -2,6 +2,8 @@
 
 from langchain.agents.middleware.file_search import FilesystemFileSearchMiddleware
 from langchain_core.tools import StructuredTool, ToolException
+from agent_service.failure import failure_info
+from agent_service.policy import active_call
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_service.execution_adapter import ControlledShellMiddleware
@@ -48,6 +50,8 @@ def file_tools(scope=None):
                     raise RuntimeError("Tool schema declaration cannot execute")
                 result = await scope.file_call(name, args)
                 if "error" in result:
+                    info = failure_info(result.get("code", "FILE_OPERATION_FAILED"))
+                    active_call.get().diagnostic = info
                     raise ToolException(result["error"])
                 content = result.pop("content")
                 if result.get("truncated"):

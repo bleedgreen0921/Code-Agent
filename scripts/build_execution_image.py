@@ -7,11 +7,13 @@ ROOT = Path(__file__).resolve().parents[1]
 TAG = "agent-execution:workspace-v1"
 
 
-def build():
+def build(*, output=None):
     subprocess.run(
         ["docker", "build", "-f", "execution/Dockerfile", "-t", TAG, "."],
         cwd=ROOT,
         check=True,
+        stdout=output,
+        stderr=subprocess.STDOUT if output is not None else None,
     )
     return subprocess.check_output(
         ["docker", "image", "inspect", "--format", "{{.Id}}", TAG], text=True

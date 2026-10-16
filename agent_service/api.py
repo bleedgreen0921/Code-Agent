@@ -12,7 +12,6 @@ from contracts.v1 import (
 from fastapi import APIRouter, Header, Query, Request, Response
 from agent_service.trace import encode_trace, trace_config
 
-from agent_service.storage import public_run
 
 router = APIRouter(prefix="/v1")
 
@@ -70,7 +69,7 @@ async def summary(request: Request):
 
 @router.get("/runs/{run_id}")
 async def run(run_id: UUID, request: Request):
-    return public_run(await db(request).get(run_id))
+    return await db(request).run_detail(run_id)
 
 
 @router.post("/runs/{run_id}/cancel")
@@ -163,7 +162,7 @@ async def submit_turn(
 
 @router.get("/conversations/{conversation_id}/turns/{turn_id}")
 async def turn(conversation_id: UUID, turn_id: UUID, request: Request):
-    return public_run(await db(request).get(turn_id, conversation_id))
+    return await db(request).run_detail(turn_id, conversation_id)
 
 
 @router.post("/conversations/{conversation_id}/turns/{turn_id}/cancel")

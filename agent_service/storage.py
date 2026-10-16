@@ -11,9 +11,11 @@ from contracts.errors import ApiError
 from contracts.v1 import ErrorCode
 from psycopg.types.json import Jsonb
 
+from agent_service.failure import failure_info, validated_info
 from agent_service.profiles import Registry
 from agent_service.tasks import TaskStore
 from agent_service.background_store import BackgroundStore
+from agent_service.diagnostics import DiagnosticStore
 
 log = logging.getLogger(__name__)
 ACTIVE = ("queued", "running", "cancelling")
@@ -21,7 +23,7 @@ TERMINAL = ("completed", "failed", "cancelled")
 ADMISSION_LOCK = 81431002
 
 
-class Store(TaskStore, BackgroundStore):
+class Store(TaskStore, BackgroundStore, DiagnosticStore):
     def __init__(self, pool, settings, registry=None):
         self.pool, self.settings = pool, settings
         self.registry = registry or Registry.from_env()
@@ -37,7 +39,7 @@ class Store(TaskStore, BackgroundStore):
             revisions = await (
                 await conn.execute("SELECT version_num FROM agent.alembic_version")
             ).fetchall()
-            if revisions != [{"version_num": "core_0005"}]:
+            if revisions != [{"version_num": "core_0006"}]:
                 raise RuntimeError("Core database baseline required")
             await conn.execute("SELECT 1 FROM agent.checkpoints LIMIT 1")
             await conn.execute("SELECT 1 FROM agent.store LIMIT 1")
@@ -53,7 +55,7 @@ class Store(TaskStore, BackgroundStore):
                     signature[key] = [list(r.values()) for r in rows]
             if (
                 signature
-                != json.loads((ROOT / "structure.json").read_text())["core_0005"]
+                != json.loads((ROOT / "structure.json").read_text())["core_0006"]
             ):
                 raise RuntimeError("Core structure mismatch")
             from langgraph.store.postgres import PostgresStore
@@ -97,10 +99,21 @@ class Store(TaskStore, BackgroundStore):
             "INSERT INTO agent.events(run_id,status,error_code) VALUES(%s,%s,%s)",
             (run_id, status, error_code),
         )
-        log.info(
-            "run_transition",
-            extra={"run_id": str(run_id), "status": status, "error_code": error_code},
-        )
+        task = await (
+            await conn.execute("SELECT task_id FROM agent.runs WHERE id=%s", (run_id,))
+        ).fetchone()
+        try:
+            log.info(
+                "run_transition",
+                extra={
+                    "run_id": str(run_id),
+                    "task_id": task["task_id"] if task else None,
+                    "status": status,
+                    "error_code": error_code,
+                },
+            )
+        except Exception:
+            pass
 
     async def sweep(self, conn):
         rows = await (
@@ -112,15 +125,24 @@ class Store(TaskStore, BackgroundStore):
             RETURNING id,status,error_code""")
         ).fetchall()
         for row in rows:
+            await conn.execute(
+                "UPDATE agent.runs SET failure_info=%s WHERE id=%s",
+                (Jsonb(failure_info(row["error_code"])), row["id"]),
+            )
             await self.event(conn, row["id"], row["status"], row["error_code"])
         unknown = await (
-            await conn.execute("""UPDATE agent.external_operations AS op
-            SET state='unknown',error_code='MCP_RESULT_UNKNOWN',finished_at=clock_timestamp()
+            await conn.execute(
+                """UPDATE agent.external_operations AS op
+            SET state='unknown',error_code='MCP_RESULT_UNKNOWN',failure_info=%s,finished_at=clock_timestamp()
             FROM agent.runs AS r WHERE op.run_id=r.id AND op.state='dispatched'
             AND (r.status IN ('completed','failed','cancelled') OR r.lease_until<=clock_timestamp()
-                 OR r.lease_token<>op.lease_token) RETURNING op.run_id""")
+                 OR r.lease_token<>op.lease_token) RETURNING op.run_id,r.task_id""",
+                (Jsonb(failure_info("MCP_RESULT_UNKNOWN")),),
+            )
         ).fetchall()
         for item in unknown:
+            if item["task_id"]:
+                await self.stop_task(conn, item["task_id"], code="MCP_RESULT_UNKNOWN")
             await self.event(
                 conn, item["run_id"], "external_operation_unknown", "MCP_RESULT_UNKNOWN"
             )
@@ -319,6 +341,20 @@ class Store(TaskStore, BackgroundStore):
             raise ApiError(404, ErrorCode.NOT_FOUND, "Run not found")
         return row
 
+    async def run_detail(self, run_id, conversation_id=None):
+        async with self.snapshot() as conn:
+            row = await (
+                await conn.execute("SELECT * FROM agent.runs WHERE id=%s", (run_id,))
+            ).fetchone()
+            if not row or (
+                conversation_id is not None
+                and row["conversation_id"] != conversation_id
+            ):
+                raise ApiError(404, ErrorCode.NOT_FOUND, "Run not found")
+            return public_run(row) | {
+                "unresolved": await self.unresolved(run_id=run_id, conn=conn)
+            }
+
     async def runs(
         self,
         *,
@@ -509,6 +545,13 @@ class Store(TaskStore, BackgroundStore):
                     AND r.lease_token=e.lease_token AND r.status='running'
                     AND r.lease_until>clock_timestamp() AND r.deadline_at>clock_timestamp())
                     AND e.state IN ('reserved','active')""")
+            identity_values = []
+            for key in ("daemon_id", "container_id"):
+                if key in changes:
+                    suffix += sql.SQL(
+                        " AND (e.{} IS NULL OR e.{} IS NOT DISTINCT FROM %s)"
+                    ).format(sql.Identifier(key), sql.Identifier(key))
+                    identity_values.append(changes[key])
             assignments = sql.SQL(",").join(
                 sql.SQL("{}=%s").format(sql.Identifier(k)) for k in changes
             )
@@ -519,7 +562,14 @@ class Store(TaskStore, BackgroundStore):
             )
             result = await (
                 await conn.execute(
-                    statement, (*changes.values(), changes.get("state"), run_id, token)
+                    statement,
+                    (
+                        *changes.values(),
+                        changes.get("state"),
+                        run_id,
+                        token,
+                        *identity_values,
+                    ),
                 )
             ).fetchone()
             if result and "state" in changes:
@@ -588,6 +638,7 @@ class Store(TaskStore, BackgroundStore):
         answer=None,
         checkpoint=None,
         error_code=None,
+        failure_info=None,
         cancelled=False,
         delivered=(),
     ):
@@ -636,9 +687,18 @@ class Store(TaskStore, BackgroundStore):
                 if occupied:
                     return False
                 status = "completed"
+            from agent_service.failure import failure_info as describe_failure
+
+            info = (
+                validated_info(failure_info)
+                if failure_info is not None and failure_info["code"] == error_code
+                else describe_failure(error_code)
+                if error_code
+                else None
+            )
             published = await (
                 await conn.execute(
-                    """UPDATE agent.runs SET status=%s,answer=%s,final_checkpoint=%s,error_code=%s,
+                    """UPDATE agent.runs SET status=%s,answer=%s,final_checkpoint=%s,error_code=%s,failure_info=%s,
                 finished_at=clock_timestamp() WHERE id=%s AND lease_token=%s
                 AND status IN ('running','cancelling') AND lease_until>clock_timestamp()
                 AND deadline_at>clock_timestamp() RETURNING id""",
@@ -647,6 +707,7 @@ class Store(TaskStore, BackgroundStore):
                         answer,
                         Jsonb(checkpoint) if checkpoint is not None else None,
                         error_code,
+                        Jsonb(info) if info else None,
                         run_id,
                         token,
                     ),
@@ -740,6 +801,7 @@ def public_run(row):
             "started_at",
             "finished_at",
             "error_code",
+            "failure_info",
         )
     } | {
         "run_id": str(row["id"]),

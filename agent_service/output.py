@@ -64,9 +64,18 @@ def bounded_artifact(value, max_bytes=16384):
             return item
         return "[unsupported artifact omitted]"
 
+    # Reserve trusted diagnosis before trimming unrelated artifact data.
+    diagnosis = None
+    if isinstance(value, dict) and value.get("failure_info") is not None:
+        from agent_service.failure import validated_info
+
+        diagnosis = validated_info(value["failure_info"])
     result = clean(value)
     if len(json.dumps(result, ensure_ascii=False, default=str).encode()) > max_bytes:
-        return {"truncated": True, "message": "Artifact exceeded output limit"}
+        fallback = {"truncated": True, "message": "Artifact exceeded output limit"}
+        if diagnosis is not None:
+            fallback["failure_info"] = diagnosis
+        return fallback
     return (
         value
         if isinstance(value, (dict, list, tuple, str, int, float, bool))

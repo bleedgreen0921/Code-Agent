@@ -8,6 +8,10 @@ import stat
 import subprocess
 import sys
 
+class VersionConflict(ValueError):
+    pass
+
+
 VERSION = "workspace-v1"
 ROOT = Path("/workspace")
 
@@ -86,7 +90,7 @@ def file_operation(operation, args, maximum):
         else:
             data, info = read_at(fd, name, maximum)
             if hashlib.sha256(data).hexdigest() != args.get("expected_hash"):
-                raise ValueError("Content hash conflict; read the file again")
+                raise VersionConflict("Content hash conflict; read the file again")
             text = data.decode("utf-8")
             old = args.get("old_text")
             if not old or text.count(old) != 1:
@@ -120,7 +124,7 @@ def file_operation(operation, args, maximum):
                 info.st_dev,
                 info.st_ino,
             ):
-                raise ValueError("Content hash conflict; read the file again")
+                raise VersionConflict("Content hash conflict; read the file again")
             os.replace(temp_name, name, src_dir_fd=fd, dst_dir_fd=fd)
         return {
             "content": "File created" if create else "File updated",
@@ -232,7 +236,7 @@ def main():
             result["truncated"] = True
         print(json.dumps(result, ensure_ascii=True))
     except (ValueError, OSError, UnicodeError) as exc:
-        print(json.dumps({"error": str(exc)[:500]}))
+        print(json.dumps({"error": str(exc)[:500], "code": "FILE_VERSION_CONFLICT" if isinstance(exc, VersionConflict) else "FILE_OPERATION_FAILED"}))
 
 
 if __name__ == "__main__":

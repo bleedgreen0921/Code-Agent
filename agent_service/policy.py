@@ -8,6 +8,12 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 from agent_service.schema import local_schema
+from agent_service.failure import (
+    failure_info,
+    is_control,
+    control_types,
+    exception_code,
+)
 from langgraph.types import Command
 
 from langchain.agents.middleware import (
@@ -37,6 +43,7 @@ class Call:
     entered: bool = False
     violation: BaseException | None = None
     failure: BaseException | None = None
+    diagnostic: dict | None = None
 
 
 active_call = ContextVar("active_tool_call", default=None)
@@ -67,12 +74,28 @@ class ToolLifecycleMiddleware(AgentMiddleware):
         if isinstance(result, ToolMessage):
             from agent_service.output import safe_content, bounded_artifact
 
-            content, truncated = limit_output(
-                safe_content(result.content), *self.output_limits
-            )
+            import json
+
             artifact = bounded_artifact(result.artifact, self.output_limits[0])
+            budget = self.output_limits[0]
+            if isinstance(artifact, dict) and artifact.get("failure_info"):
+                # The diagnosis and content share the existing output byte budget.
+                artifact = bounded_artifact(artifact, max(384, budget - 64))
+                budget -= len(json.dumps(artifact, ensure_ascii=False).encode("utf-8"))
+            content, truncated = limit_output(
+                safe_content(result.content), max(32, budget), self.output_limits[1]
+            )
             if truncated and isinstance(artifact, dict):
                 artifact = {**artifact, "truncated": True}
+                if artifact.get("failure_info"):
+                    budget = self.output_limits[0] - len(
+                        json.dumps(artifact, ensure_ascii=False).encode("utf-8")
+                    )
+                    content = limit_output(
+                        safe_content(result.content),
+                        max(32, budget),
+                        self.output_limits[1],
+                    )[0]
             result = result.model_copy(
                 update={"content": content, "artifact": artifact}
             )
@@ -121,6 +144,8 @@ class ToolLifecycleMiddleware(AgentMiddleware):
                 "tool_call_started",
                 extra={
                     "run_id": getattr(call.context, "run_id", None),
+                    "task_id": getattr(call.context, "task_id", None),
+                    "agent_id": getattr(call.context, "agent_id", None),
                     "call_id": call.call_id,
                     "tool_name": call.name,
                 },
@@ -128,6 +153,7 @@ class ToolLifecycleMiddleware(AgentMiddleware):
         except Exception:
             pass
         outcome = "exception"
+        error_code = None
         try:
             result = await handler(request)
             # Hooks cannot suppress control failures or repeat execution.
@@ -135,6 +161,23 @@ class ToolLifecycleMiddleware(AgentMiddleware):
                 raise call.violation
             if call.failure is not None:
                 raise call.failure
+            if (
+                isinstance(result, ToolMessage)
+                and call.diagnostic
+                and result.status == "error"
+            ):
+                result = result.model_copy(
+                    update={
+                        "artifact": {
+                            **(
+                                result.artifact
+                                if isinstance(result.artifact, dict)
+                                else {}
+                            ),
+                            "failure_info": call.diagnostic,
+                        }
+                    }
+                )
             if self.output_limits:
                 result = self.limit_result(result)
             candidates = getattr(call.context, "result_delivery", None)
@@ -147,9 +190,13 @@ class ToolLifecycleMiddleware(AgentMiddleware):
                 ):
                     call.context.delivered_results.add(operation_id)
             outcome = getattr(result, "status", type(result).__name__)
+            artifact = getattr(result, "artifact", None)
+            if isinstance(artifact, dict) and artifact.get("failure_info"):
+                error_code = artifact["failure_info"]["code"]
             return result
         except BaseException as exc:
             outcome = type(exc).__name__
+            error_code = exception_code(exc)
             raise
         finally:
             active_call.reset(token)
@@ -158,10 +205,13 @@ class ToolLifecycleMiddleware(AgentMiddleware):
                     "tool_call_finished",
                     extra={
                         "run_id": getattr(call.context, "run_id", None),
+                        "task_id": getattr(call.context, "task_id", None),
+                        "agent_id": getattr(call.context, "agent_id", None),
                         "call_id": call.call_id,
                         "tool_name": call.name,
                         "duration_seconds": time.monotonic() - started,
                         "result_type": outcome,
+                        "error_code": error_code,
                     },
                 )
             except Exception:
@@ -221,6 +271,9 @@ class PermissionMiddleware(AgentMiddleware):
                         tool_call_id=call.call_id,
                         name=call.name,
                         status="error",
+                        artifact={
+                            "failure_info": failure_info("INVALID_TOOL_ARGUMENTS")
+                        },
                     )
             if not denied and call.name in policy.validators:
                 # The same tool schema used by the native executor parses arguments.
@@ -235,6 +288,7 @@ class PermissionMiddleware(AgentMiddleware):
                         else schema.model_validate(request.tool_call["args"])
                     )
                 except ValidationError:
+                    call.diagnostic = failure_info("INVALID_TOOL_ARGUMENTS")
                     parsed = None
                 if parsed is not None:
                     denied = policy.validators[call.name](parsed, call.context) is False
@@ -249,7 +303,17 @@ class PermissionMiddleware(AgentMiddleware):
                 tool_call_id=call.call_id,
                 name=call.name,
                 status="error",
+                artifact={"failure_info": failure_info("PERMISSION_DENIED")},
             )
+        if request.tool is not None and not isinstance(
+            request.tool.tool_call_schema, dict
+        ):
+            from pydantic import ValidationError
+
+            try:
+                request.tool.tool_call_schema.model_validate(request.tool_call["args"])
+            except ValidationError:
+                call.diagnostic = failure_info("INVALID_TOOL_ARGUMENTS")
         try:
             return await handler(request)
         except BaseException as exc:
@@ -261,24 +325,7 @@ class ToolErrorMiddleware(NativeToolErrorMiddleware):
     """Recover only explicitly listed execution errors; never control exceptions."""
 
     def __init__(self, recoverable):
-        from langchain.agents.middleware.model_call_limit import (
-            ModelCallLimitExceededError,
-        )
-        from langchain.agents.middleware.tool_call_limit import (
-            ToolCallLimitExceededError,
-        )
-        from langgraph.errors import GraphBubbleUp
-
-        from agent_service.execution_errors import ExecutionFailure
-
-        controls = (
-            ExecutionFailure,
-            HookContractError,
-            TimeoutError,
-            ModelCallLimitExceededError,
-            ToolCallLimitExceededError,
-            GraphBubbleUp,
-        )
+        controls = control_types()
         if any(
             not isinstance(t, type)
             or not issubclass(t, Exception)
@@ -291,7 +338,7 @@ class ToolErrorMiddleware(NativeToolErrorMiddleware):
         recoverable = tuple(recoverable)
 
         def on_error(exc, request):
-            if isinstance(exc, recoverable):
+            if not is_control(exc) and isinstance(exc, recoverable):
                 return (
                     '{"code":"TOOL_EXECUTION_ERROR","message":"Tool execution failed."}'
                 )
@@ -320,24 +367,23 @@ class ExecutionControlMiddleware(AgentMiddleware):
             raise
 
     async def awrap_tool_call(self, request, handler):
-        import asyncio
-        from langchain.agents.middleware.model_call_limit import (
-            ModelCallLimitExceededError,
-        )
-        from langchain.agents.middleware.tool_call_limit import (
-            ToolCallLimitExceededError,
-        )
-        from langgraph.errors import GraphBubbleUp
-
         try:
-            return await handler(request)
-        except (
-            asyncio.CancelledError,
-            TimeoutError,
-            GraphBubbleUp,
-            ModelCallLimitExceededError,
-            ToolCallLimitExceededError,
-        ) as exc:
+            result = await handler(request)
             call = active_call.get()
-            call.failure = exc
+            if (
+                isinstance(result, ToolMessage)
+                and result.status == "error"
+                and call
+                and call.diagnostic is None
+            ):
+                artifact = result.artifact if isinstance(result.artifact, dict) else {}
+                call.diagnostic = artifact.get("failure_info") or failure_info(
+                    "TOOL_EXECUTION_ERROR"
+                )
+            return result
+        except BaseException as exc:
+            if is_control(exc):
+                call = active_call.get()
+                if call:
+                    call.failure = exc
             raise

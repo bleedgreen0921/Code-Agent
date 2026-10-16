@@ -478,9 +478,12 @@ def test_uncertain_create_and_daemon_mismatch_preserve_occupancy(database, tmp_p
             resource["state"] == "cleanup_failed"
             and "unknown" in resource["cleanup_error"]
         )
-        await r.store.resource_update(
-            row["id"], row["lease_token"], daemon_id="different", phase="created"
-        )
+        # Inject persisted identity corruption; ordinary updates cannot rebind resources.
+        async with r.pool.connection() as conn:
+            await conn.execute(
+                "UPDATE agent.execution_resources SET daemon_id='different',phase='created' WHERE run_id=%s",
+                (row["id"],),
+            )
         await recover_resources(r.store, r.registry.execution)
         resource = await r.store.execution_resource(row["id"])
         assert (

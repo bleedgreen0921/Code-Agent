@@ -7,16 +7,14 @@ import signal
 from contextlib import suppress
 from uuid import uuid4
 
-import openai
 import psycopg
-from langchain.agents.middleware.model_call_limit import ModelCallLimitExceededError
-from langchain.agents.middleware.tool_call_limit import ToolCallLimitExceededError
 from langchain_core.messages import HumanMessage
 
+from agent_service.failure import failure_info, control_leaf, exception_code
 from agent_service.resources import Resources
 from agent_service.execution import ExecutionScope, recover_resources, check_environment
 from agent_service.execution_config import WORKSPACE_TOOLS
-from agent_service.execution_errors import ExecutionFailure, EnvironmentUnavailable
+from agent_service.execution_errors import EnvironmentUnavailable
 from agent_service.execution_adapter import WorkspaceExecutionMiddleware
 from agent_service.workspace_tools import assemble
 from agent_service.profiles import ConfigurationChanged, Extension, tool_schema
@@ -314,6 +312,8 @@ class Worker:
 
     async def publish(self, row, **result):
         """Only retry publication. An uncertain commit never causes model/tool replay."""
+        if result.get("error_code") and "failure_info" not in result:
+            result["failure_info"] = failure_info(result["error_code"])
         for attempt in range(3):
             try:
                 return await self.db.finish(
@@ -377,7 +377,10 @@ class Worker:
                         abort.set()
                 except (psycopg.Error, OSError, TimeoutError):
                     # Publication still checks lease validity in the database.
-                    log.exception("lease_renewal_unconfirmed")
+                    log.exception(
+                        "lease_renewal_unconfirmed",
+                        extra={"run_id": row["id"], "task_id": row.get("task_id")},
+                    )
 
         heartbeat = asyncio.create_task(renew())
         interrupt = asyncio.create_task(abort.wait())
@@ -400,7 +403,12 @@ class Worker:
         except Exception as exc:
             result = {"error_code": failure_code(exc)}
             log.exception(
-                "run_execution_failed", extra={"run_id": str(row["id"]), **result}
+                "run_execution_failed",
+                extra={
+                    "run_id": str(row["id"]),
+                    "task_id": row.get("task_id"),
+                    **result,
+                },
             )
         finally:
             # Freeze admissions before cancelling graph work; executor threads cannot respawn.
@@ -489,25 +497,9 @@ class Worker:
 
 
 def failure_code(exc):
-    if isinstance(exc, ExecutionFailure):
-        return exc.code
-    if isinstance(exc, ConfigurationChanged):
-        return "CONFIGURATION_CHANGED"
-    if isinstance(exc, (ModelCallLimitExceededError, ToolCallLimitExceededError)):
-        return "QUOTA_EXCEEDED"
-    if isinstance(exc, openai.APITimeoutError):
-        return "MODEL_TIMEOUT"
-    if isinstance(exc, TimeoutError):
-        return "RUN_TIMEOUT"
-    if isinstance(exc, openai.AuthenticationError):
-        return "MODEL_AUTH_FAILED"
-    if isinstance(exc, openai.RateLimitError):
-        return "MODEL_RATE_LIMITED"
-    if isinstance(exc, openai.APIError):
-        return "MODEL_CALL_FAILED"
-    if isinstance(exc, IncompleteGraphError):
+    if isinstance(control_leaf(exc), IncompleteGraphError):
         return "GRAPH_INTERRUPTED"
-    return "EXECUTION_FAILED"
+    return exception_code(exc)
 
 
 async def main():
@@ -519,31 +511,8 @@ async def main():
         await worker.run()
 
 
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        payload = {
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-        }
-        for key in (
-            "run_id",
-            "status",
-            "error_code",
-            "history_tokens_approx",
-            "request_tokens_approx",
-            "reported_usage",
-            "delegation",
-        ):
-            if hasattr(record, key):
-                payload[key] = getattr(record, key)
-        if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
-        return json.dumps(payload, ensure_ascii=False)
-
-
 if __name__ == "__main__":
-    handler = logging.StreamHandler()
-    handler.setFormatter(JsonFormatter())
-    logging.basicConfig(level=logging.INFO, handlers=[handler])
+    from agent_service.logging import install_logging
+
+    install_logging()
     asyncio.run(main())

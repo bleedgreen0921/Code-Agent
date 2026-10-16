@@ -1,6 +1,8 @@
 # Agent 执行框架
 
-本机运行的任务 API、异步 Worker 和 PostgreSQL 持久化。执行层使用 LangChain `create_agent`、原生消息状态、PostgreSQL Checkpointer 和摘要中间件。提供空工具聊天、容器内工作区搜索读取和文件修改/Shell 三种内置 Profile。所有工作区工具在 Docker 中运行，直接修改注册目录。
+本机运行的 Agent 执行服务，包含任务 API、异步 Worker 和 PostgreSQL 持久化。执行层使用 LangChain `create_agent`、原生消息状态、PostgreSQL Checkpointer 和摘要中间件。提供空工具聊天、容器内工作区搜索读取和文件修改/Shell 三种内置 Profile，并支持 Todo、Skills、受控只读委派、人工管理的项目知识、静态授权 MCP 工具，以及独立持久 Task 与后台操作。所有工作区工具在 Docker 中运行，直接修改注册目录。
+
+基础增强阶段 1～6 已全部实施，当前数据库版本为 `core_0005`。最新阶段六验收记录为 245 项测试、零失败/错误/跳过；测试使用合成模型，实际模型任务效果需单独评估。各阶段交付、验收和暂缓能力见 [基础增强路线图](docs/基础架构增强路线图.md)。
 
 ## 安装与初始化
 
@@ -59,7 +61,7 @@ curl -X POST http://127.0.0.1:8002/v1/runs \
   -d '{"task":"讨论项目","profile":"project-chat","workspace_id":"project"}'
 ```
 
-配置声明版本、工作区、Profile、技能目录及受限的 execution 配置。工具仅能选用启动时的可信注册表，不可通过 TOML 或 HTTP 指定 Python 模块、工具实现、middleware、状态或输出 Schema。未知工具、保留名称冲突、非法根目录导致启动失败。修改配置后按上述停止/重启流程上线；不支持热更新。
+配置声明版本、工作区、Profile、技能目录、execution 限制、knowledge 开关及静态 MCP 服务。工具仅能选用启动时的可信注册表，不可通过 TOML 或 HTTP 指定 Python 模块、工具实现、middleware、状态或输出 Schema。未知工具、保留名称冲突、非法根目录导致启动失败。修改配置后按上述停止/重启流程上线；不支持热更新。
 
 以下配置均使用 `AGENT_` 前缀，数值为正。时间单位为秒，token 数为框架估算值。
 
@@ -112,6 +114,8 @@ export AGENT_RUNTIME_CONFIG=/absolute/path/to/runtime.toml
 | `chat` | 无 | 不启动 Docker；可不绑定工作区 |
 | `workspace_read` | `glob_search`、`grep_search`、`read_file` | 必须绑定；只读挂载 |
 | `workspace_write` | 上述工具、`edit_file`、`shell` | 必须绑定；读写挂载 |
+
+表中列出工作区执行工具。两个工作区 Profile 还默认启用 `write_todos`、`delegate_read`；注册技能时启用 `read_skill`，开启项目知识时启用 `knowledge_get`、`knowledge_search`。MCP 与后台工具由自定义 Profile 显式选择。
 
 自定义 Profile 可选择这些工具的子集；包含 edit_file 或 shell 时使用读写挂载，其余子集只读。内置搜索复用锁定版本的 `FilesystemFileSearchMiddleware`，在容器内调用，固定使用 rg；Shell 复用 `ShellToolMiddleware` 和派生 Docker 策略。兼容实现集中在 [execution_adapter.py](agent_service/execution_adapter.py)。
 
@@ -167,9 +171,9 @@ API 和 Worker 启动时读取不可变技能快照，修改后须同步重启�
 
 每次主模型调用在扩展 Hook 之后补入可信 Profile 提示、工作区模式、工具范围、无网络、截止时间、失败不回滚、技能目录和当前 Run 的 Todo。尚未规划时明确清单为空。这些上下文仅用于本次请求，不写入消息历史或逐轮积累。日志事件 `model_context` 记录 `history_tokens_approx` 与 `request_tokens_approx`，后者包含系统内容和工具 Schema；估算不是硬配额。摘要仍使用原生模板、分段和重试策略，仅附加代码任务的保留提示，默认触发/保留/输入裁剪分别为 20000/6000/16000 token。
 
-会话唯一继承白名单为 messages：只读取同会话上一成功 Run 发布的明确最终 checkpoint，继承原生摘要和历史工具消息。Todo、计数、业务状态、结构化结果和运行资源每轮重新开始。失败、取消和失租轮次不参与继承。本阶段没有新增表、迁移、详情字段、端点或流式协议。
+会话唯一继承白名单为 messages：只读取同会话上一成功 Run 发布的明确最终 checkpoint，继承原生摘要和历史工具消息。Todo、计数、业务状态、结构化结果和运行资源每轮重新开始。失败、取消和失租轮次不参与继承。上下文与技能能力在阶段三未新增表、迁移、详情字段、端点或流式协议；当前 Task 续执行的消息与结果衔接见下文“持久任务与后台操作”。
 
-现有 `/v1/runs/{run_id}/trace` 和 `python -m db.trace_run RUN_UUID` 可查看原生 checkpoint 的 `channel_values.todos` 与工具消息，按配置中的最终 checkpoint_id 定位成功结果。`runtime_config` 记录上下文策略版本、Todo 限制、可见技能及哈希、摘要提示版本；技能正文只进入工具消息，不复制到配置快照。架构与扩展规则见 [架构说明](docs/architecture.md) 和 [运行说明](docs/runtime.md)，本阶段验证见 [阶段三验收](docs/阶段三实施验收.md)。
+现有 `/v1/runs/{run_id}/trace` 和 `python -m db.trace_run RUN_UUID` 可查看原生 checkpoint 的 `channel_values.todos` 与工具消息，按配置中的最终 checkpoint_id 定位成功结果。`runtime_config` 记录上下文策略版本、Todo 限制、可见技能及哈希、摘要提示版本；技能正文只进入工具消息，不复制到配置快照。架构与扩展规则见 [架构说明](docs/architecture.md) 和 [运行说明](docs/runtime.md)，上下文与技能能力的阶段三验证见 [阶段三验收](docs/阶段三实施验收.md)。
 
 ## 受控只读委派（阶段四）
 
@@ -190,23 +194,32 @@ API 和 Worker 启动时读取不可变技能快照，修改后须同步重启�
 python -m db.trace_run RUN_UUID
 python -m db.trace_run RUN_UUID --namespace ''
 python -m db.trace_run RUN_UUID --namespace 'tools:FRAMEWORK_GENERATED_ID'
-curl 'http://127.0.0.1:8000/v1/runs/RUN_UUID/trace?namespace='
+curl 'http://127.0.0.1:8002/v1/runs/RUN_UUID/trace?namespace='
 ```
 
-数据库继续使用 `core_0003`，本阶段不增加依赖、表或迁移。API 与 Worker 必须同步更新和重启；已有工作区 Profile 的排队绑定变化仍按 `CONFIGURATION_CHANGED` 处理，默认 chat 保持既有绑定。详见 [阶段四验收](docs/阶段四实施验收.md)。
+只读委派在阶段四未增加依赖、表或迁移，当时数据库版本为 `core_0003`；当前部署统一升级到 `core_0006`。API 与 Worker 必须同步更新和重启；已有工作区 Profile 的排队绑定变化仍按 `CONFIGURATION_CHANGED` 处理，默认 chat 保持既有绑定。详见 [阶段四验收](docs/阶段四实施验收.md)。
 
 
 ## 项目知识与 MCP（阶段五）
 
 通过 `[knowledge].enabled = true` 开启人工管理、Agent 只读的项目知识。新增工作区知识 GET/PUT/DELETE 管理 API，使用 ETag 前置条件和事务锁；Agent 通过 knowledge_get/knowledge_search 获取当前条目或元数据列表，不提供文本检索、Embedding 或自动记忆写入。
 
-静态 `[mcp]` 声明 HTTP 服务、本地 tools/list 目录、凭据环境变量引用和 read/write 分类，Profile.tools 显式选择稳定别名；三个内置 Profile 不自动获得 MCP。Worker 使用原生 MCPAdapter，每 Run 独立连接和契约核验；写调用独占批次、先记录派发，未知结果终止 Run，不重发请求。知识或 MCP 单独使用均无需 Docker，已有工作区容器继续无网络。
+静态 `[mcp]` 声明 HTTP 服务、本地 tools/list 目录、凭据环境变量引用和 read/write 分类，Profile.tools 显式选择稳定别名；三个内置 Profile 不自动获得 MCP。同步 MCP 工具由 Worker 使用原生 MCPAdapter，每 Run 独立连接和契约核验；写调用独占批次、先记录派发，未知结果终止 Run，不重发请求。知识或 MCP 单独使用均无需 Docker，已有工作区容器继续无网络。
 
-部署须升级 core_0004 并重新 bootstrap，API/Worker 不执行 DDL。配置、完整 API、目录导出、凭据配置和外部结果核对见 [项目知识与外部工具](docs/项目知识与外部工具.md)，验收证据见 [阶段五验收](docs/阶段五实施验收.md)。
+阶段五通过 `core_0004` 增加外部写入审计并初始化原生 Store；当前部署须迁移到 `core_0006` 并重新 bootstrap，API/Worker 不执行 DDL。配置、完整 API、目录导出、凭据配置和外部结果核对见 [项目知识与外部工具](docs/项目知识与外部工具.md)，验收证据见 [阶段五验收](docs/阶段五实施验收.md)。
 
 
 ## 持久任务与后台操作
 
-`POST /v1/tasks` 创建独立 Task，固定目标、Profile、工作区与前置依赖。后台命令和原生 MCP Tasks 立即启动，等待结果时释放 Run 槽；Worker 重启核对已有资源，结果到达后创建唯一续 Run。当前 Task 在本地后台执行期间可读取和只读委派，文件可能变化；写入和普通 Shell 被禁止。未知结果失败且不自动重试，外部副作用无法撤回。
+`POST /v1/tasks` 创建独立 Task，固定目标、Profile、工作区与前置依赖。后台命令和原生 MCP Tasks 立即启动；Run 发布阶段报告后释放执行槽。Worker 重启核对已有资源，后台结果若未被成功 Run 消费，在操作结束并确认清理后创建唯一续 Run。当前 Task 在本地后台执行期间可读取和只读委派，文件可能变化；写入和普通 Shell 被禁止。未知结果失败且不自动重试，外部副作用无法撤回。
 
-部署升级 core_0005、重新 bootstrap 并构建新执行镜像。显式选择配置示例的 task-workspace Profile；内置 Profile 不增加后台工具。API、默认限额、状态和故障核对见 [持久任务与后台操作](docs/持久任务与后台操作.md)。
+阶段六引入 core_0005；当前部署升级 core_0006、重新 bootstrap 并构建新执行镜像。显式选择配置示例的 task-workspace Profile；内置 Profile 不增加后台工具。API、默认限额、状态和故障核对见 [持久任务与后台操作](docs/持久任务与后台操作.md)。
+
+
+## 第一批：异常契约与诊断
+
+当前数据库版本为 `core_0006`，只新增 Run、后台操作、同步外部操作的可空 `failure_info`。详情增加只读 `unresolved`，doctor 同时提供全局摘要。历史 `failure_info: null` 表示该记录未提供详情，不回填或推断历史副作用。
+
+非法后台回执不能成功；普通更新保护操作终态、结果和原资源身份。操作未知与 Task 失败在同一事务内保存，内部迟到事实补记不会恢复 Task、消费结果或改写已发布 checkpoint。清理字段与执行结果独立。API 和 Worker 的受支持入口安装同一安全 JSON 日志格式器，保留关联字段及堆栈位置，省略异常消息、源码和参数。
+
+部署顺序为停止旧 API/Worker → owner 执行 `python -m db.migrate` → `python -m db.bootstrap` → `python -m db.doctor --json` → 启动新进程。运行角色无需增加权限。第一批不增加重试、自动重放、恢复接口或工作区回滚。完整字段、状态规则及边界见 [异常契约与诊断](docs/第一批异常契约与诊断.md)，验证证据见 [独立验收记录](docs/第一批异常契约与诊断验收.md)。

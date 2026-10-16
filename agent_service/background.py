@@ -11,8 +11,9 @@ from uuid import UUID
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool, ToolException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from agent_service.failure import failure_info, is_control
 from agent_service.background_store import public_operation
 from agent_service.execution import DockerClient, LABEL, FIXED_ENV, check_environment
 from agent_service.external_operations import ExternalFailure
@@ -30,6 +31,44 @@ BACKGROUND_TOOLS = {
 }
 
 
+class BackgroundReceipt(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
+    exit_code: int
+    timed_out: bool
+    cancelled: bool
+    truncated: bool
+    total_bytes: int = Field(ge=0)
+    output: str
+
+    @model_validator(mode="after")
+    def consistent(self):
+        if self.timed_out and self.cancelled:
+            raise ValueError("Contradictory receipt flags")
+        return self
+
+
+def docker_identity(inspected, op):
+    """Validate only fields needed for observing and destroying the original resource."""
+    try:
+        identity = inspected["Id"]
+        labels = inspected["Config"]["Labels"]
+        state = inspected["State"]
+        valid = (
+            isinstance(identity, str)
+            and len(identity) == 64
+            and (not op["container_id"] or identity == op["container_id"])
+            and labels.get(LABEL) == op["container_name"]
+            and labels.get("io.agent-framework.operation") == str(op["id"])
+            and type(state["Running"]) is bool
+            and isinstance(state["Status"], str)
+        )
+    except (KeyError, TypeError, AttributeError):
+        valid = False
+    if not valid:
+        raise ExternalFailure("BACKGROUND_RESOURCE_IDENTITY_CHANGED")
+    return identity
+
+
 class ShellInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     command: str = Field(min_length=1, max_length=32768)
@@ -41,6 +80,13 @@ class OperationInput(BaseModel):
     operation_id: UUID
 
 
+def reject_background(code, message=None):
+    call = active_call.get()
+    if call:
+        call.diagnostic = failure_info(code, effect="not_dispatched")
+    raise ToolException(message or code)
+
+
 def authorized(row, *, start=None):
     call = active_call.get()
     if (
@@ -50,13 +96,13 @@ def authorized(row, *, start=None):
         or getattr(call.context, "agent_depth", 0)
         or getattr(call.context, "task_id", None) != str(row["task_id"])
     ):
-        raise ToolException("BACKGROUND_REQUIRES_TASK_ROOT")
+        reject_background("BACKGROUND_REQUIRES_TASK_ROOT")
     if start and (
         len(call.batch) != 1
         or call.batch[0]["name"] != start
         or call.batch[0]["id"] != call.call_id
     ):
-        raise ToolException("BACKGROUND_START_BATCH_REJECTED")
+        reject_background("BACKGROUND_START_BATCH_REJECTED")
     return call
 
 
@@ -75,6 +121,9 @@ class BackgroundBatchMiddleware(AgentMiddleware):
                 content='{"code":"BACKGROUND_START_BATCH_REJECTED"}',
                 tool_call_id=call.call_id,
                 status="error",
+                artifact={
+                    "failure_info": failure_info("BACKGROUND_START_BATCH_REJECTED")
+                },
             )
         return await handler(request)
 
@@ -83,14 +132,16 @@ def background_tools(db=None, row=None, registry=None):
     async def start_background_shell(command: str, cwd: str = "."):
         call = authorized(row, start="start_background_shell")
         if Path(cwd).is_absolute() or ".." in Path(cwd).parts or "\x00" in cwd:
-            raise ToolException("Invalid workspace-relative directory")
+            reject_background(
+                "INVALID_TOOL_ARGUMENTS", "Invalid workspace-relative directory"
+            )
         root = registry.workspaces[row["workspace_id"]]
         try:
             target = (Path(root) / cwd).resolve(strict=True)
         except (OSError, ValueError):
-            raise ToolException("Invalid workspace directory") from None
+            reject_background("INVALID_TOOL_ARGUMENTS", "Invalid workspace directory")
         if not target.is_relative_to(root) or not target.is_dir():
-            raise ToolException("Invalid workspace directory")
+            reject_background("INVALID_TOOL_ARGUMENTS", "Invalid workspace directory")
         # Preflight does not dispatch anything. Reserved operations are never replayed.
         await check_environment(registry.execution)
         _, image_raw, _ = await DockerClient().call(
@@ -130,7 +181,7 @@ def background_tools(db=None, row=None, registry=None):
                 return await db.cancel_operation(row["task_id"], operation_id)
             return await db.operation(row["task_id"], operation_id, raw=True)
         except ApiError:
-            raise ToolException("BACKGROUND_OPERATION_NOT_FOUND") from None
+            reject_background("BACKGROUND_OPERATION_NOT_FOUND")
 
     async def background_status(operation_id: UUID):
         authorized(row)
@@ -146,7 +197,7 @@ def background_tools(db=None, row=None, registry=None):
             op["state"] not in ("succeeded", "failed", "cancelled")
             or op["cleanup_state"] != "released"
         ):
-            raise ToolException("BACKGROUND_RESULT_NOT_READY")
+            reject_background("BACKGROUND_RESULT_NOT_READY")
         # Mark only if the full bounded JSON fits the final tool output boundary.
         payload = {key: op[key] for key in ("id", "state", "error_code")}
         result = dict(op["result"] or {})
@@ -301,7 +352,12 @@ async def monitor_docker(db, registry, op):
     inspected = await client.inspect(op["container_id"] or op["container_name"])
     if inspected is None:
         if op["phase"] == "reserved":
-            await db.operation_update(
+            save = (
+                db.operation_reconcile
+                if op["state"] == "unknown"
+                else db.operation_update
+            )
+            await save(
                 op,
                 state="failed",
                 result={"error": "Dispatch did not begin"},
@@ -309,17 +365,13 @@ async def monitor_docker(db, registry, op):
                 cleanup_state="released",
             )
         elif op["state"] in OP_TERMINAL and op["container_id"]:
-            await db.operation_update(op, cleanup_state="released", cleanup_error=None)
+            await db.operation_cleanup(op, cleanup_state="released", cleanup_error=None)
         else:
             await db.operation_update(
                 op, state="unknown", error_code="BACKGROUND_RESULT_UNKNOWN"
             )
         return
-    labels = inspected["Config"].get("Labels") or {}
-    if labels.get(LABEL) != op["container_name"] or labels.get(
-        "io.agent-framework.operation"
-    ) != str(op["id"]):
-        raise ExternalFailure("BACKGROUND_RESOURCE_IDENTITY_CHANGED")
+    docker_identity(inspected, op)
     if not op["container_id"]:
         await db.operation_update(op, container_id=inspected["Id"])
     expired = datetime.now(timezone.utc) >= op["deadline_at"]
@@ -330,6 +382,7 @@ async def monitor_docker(db, registry, op):
     if inspected["State"]["Running"] and not cancel:
         await db.operation_update(op, state="running", phase="started")
         return
+    confirmed_stop = False
     if inspected["State"]["Running"]:
         # Stop the entire container, including detached process groups.
         await client.call(
@@ -338,7 +391,9 @@ async def monitor_docker(db, registry, op):
         inspected = await client.inspect(inspected["Id"])
         if not inspected or inspected["State"]["Running"]:
             raise ExternalFailure("BACKGROUND_STOP_UNCONFIRMED")
-    if op["state"] not in OP_TERMINAL:
+        docker_identity(inspected, op)
+        confirmed_stop = True
+    if op["state"] not in OP_TERMINAL or op["state"] == "unknown":
         if inspected["State"].get("Status") == "created":
             state, result, code = (
                 "failed",
@@ -348,13 +403,7 @@ async def monitor_docker(db, registry, op):
         else:
             _, raw, _ = await client.call("logs", inspected["Id"], maximum=65536)
             try:
-                result = json.loads(raw)
-                if (
-                    not isinstance(result, dict)
-                    or not {"exit_code", "timed_out", "output", "truncated"}
-                    <= result.keys()
-                ):
-                    raise ValueError("Invalid receipt")
+                result = BackgroundReceipt.model_validate_json(raw).model_dump()
                 # Leave room for delivery metadata, so background_result can return
                 # the complete persisted result within the ordinary tool boundary.
                 result["output"], clipped = limit_output(
@@ -375,21 +424,41 @@ async def monitor_docker(db, registry, op):
                 code = (
                     "BACKGROUND_TIMEOUT"
                     if stopped_for_timeout or result["timed_out"]
+                    else "BACKGROUND_COMMAND_FAILED"
+                    if result["exit_code"] != 0 and state == "failed"
                     else None
                 )
             except (ValueError, TypeError):
                 # Known cancellation can destroy the receipt, but cannot imply command success.
                 state, result, code = (
-                    ("cancelled", {"cancelled": True}, None)
-                    if cancel and not expired
-                    else ("unknown", None, "BACKGROUND_RESULT_UNKNOWN")
+                    (
+                        "cancelled",
+                        {"cancelled": True, "effect_unknown": True},
+                        "BACKGROUND_RECEIPT_INVALID",
+                    )
+                    if confirmed_stop
+                    and op["cancel_requested_at"] is not None
+                    and not expired
+                    else ("unknown", None, "BACKGROUND_RECEIPT_INVALID")
                 )
-        await db.operation_update(op, state=state, result=result, error_code=code)
+        if op["state"] != "unknown" or state != "unknown":
+            save = (
+                db.operation_reconcile
+                if op["state"] == "unknown"
+                else db.operation_update
+            )
+            await save(
+                op,
+                state=state,
+                result=result,
+                error_code=code,
+                failure_info=failure_info(code) if code else None,
+            )
     # Result commit is confirmed before resource removal; remove acknowledgements can be reconciled.
     await client.call("rm", "--force", inspected["Id"], timeout=cfg.cleanup_timeout)
     if await client.inspect(inspected["Id"]) is not None:
         raise ExternalFailure("BACKGROUND_CLEANUP_UNCONFIRMED")
-    await db.operation_update(op, cleanup_state="released", cleanup_error=None)
+    await db.operation_cleanup(op, cleanup_state="released", cleanup_error=None)
 
 
 @asynccontextmanager
@@ -402,7 +471,9 @@ async def task_connection(client):
         raise
     except (ToolException, ExternalFailure):
         raise
-    except Exception:
+    except Exception as exc:
+        if is_control(exc):
+            raise
         raise ExternalFailure("MCP_CONNECTION_FAILED") from None
 
 
@@ -460,9 +531,18 @@ def mcp_background_tool(db, row, registry, alias, entry):
                         handle.create_result.model_dump(mode="json", by_alias=True)
                     )
                     from agent_service.output import bounded_artifact
+                    from fastmcp_tasks.client_models import ClientCreateTaskResult
 
+                    try:
+                        receipt_id = ClientCreateTaskResult.model_validate(
+                            receipt
+                        ).task_id
+                    except ValidationError:
+                        receipt_id = None
                     if (
-                        bounded_artifact(receipt, 8000) != receipt
+                        receipt_id != handle.task_id
+                        or not handle.task_id
+                        or bounded_artifact(receipt, 8000) != receipt
                         or len(handle.task_id) > 1024
                     ):
                         await db.operation_update(
@@ -571,7 +651,12 @@ async def monitor_mcp(db, registry, op):
         )
         if handle.task_id != op["remote_handle"]:
             raise ExternalFailure("MCP_TASK_IDENTITY_CHANGED")
-        current = await handle.status()
+        try:
+            current = await handle.status()
+        except ValidationError:
+            raise ExternalFailure("MCP_TASK_PROTOCOL_ERROR") from None
+        if current.task_id != op["remote_handle"]:
+            raise ExternalFailure("MCP_TASK_IDENTITY_CHANGED")
         status = current.status
         delay = max(
             db.settings.background_poll_seconds, (current.poll_interval_ms or 0) / 1000
@@ -582,14 +667,19 @@ async def monitor_mcp(db, registry, op):
                 from mcp.types import CallToolResult
                 from agent_service.schema import local_schema
 
-                parsed = CallToolResult.model_validate(current.result)
-                if (
-                    entry.definition.get("outputSchema") is not None
-                    and not parsed.is_error
-                ):
-                    local_schema(entry.definition["outputSchema"]).validate(
-                        parsed.structured_content
-                    )
+                from jsonschema import ValidationError as OutputSchemaError
+
+                try:
+                    parsed = CallToolResult.model_validate(current.result)
+                    if (
+                        entry.definition.get("outputSchema") is not None
+                        and not parsed.is_error
+                    ):
+                        local_schema(entry.definition["outputSchema"]).validate(
+                            parsed.structured_content
+                        )
+                except (ValidationError, OutputSchemaError):
+                    raise ExternalFailure("MCP_TASK_PROTOCOL_ERROR") from None
             elif status == "failed" and not isinstance(current.error, dict):
                 raise ExternalFailure("MCP_TASK_PROTOCOL_ERROR")
             result = bounded_remote_result(
@@ -605,22 +695,24 @@ async def monitor_mcp(db, registry, op):
                 "failed": "failed",
                 "cancelled": "cancelled",
             }[status]
-            if (
-                status == "completed"
-                and isinstance(current.result, dict)
-                and current.result.get("isError")
-            ):
+            if status == "completed" and parsed.is_error:
                 state = "failed"
-            code = op["error_code"] or ("BACKGROUND_TIMEOUT" if expired else None)
-            if code:
+            code = "MCP_TASK_EXECUTION_FAILED" if state == "failed" else None
+            if op["state"] != "unknown" and op["error_code"] and status != "completed":
+                code = op["error_code"]
                 state = "failed"
-            if op["state"] == "unknown":
-                state = "unknown"
-            await db.operation_update(
+            # Completion is authoritative even if cancellation was requested.
+            save = (
+                db.operation_reconcile
+                if op["state"] == "unknown"
+                else db.operation_update
+            )
+            await save(
                 op,
                 state=state,
                 result=result,
                 error_code=code,
+                failure_info=failure_info(code) if code else None,
                 cleanup_state="released",
                 cleanup_error=None,
             )
@@ -635,17 +727,22 @@ async def monitor_mcp(db, registry, op):
             now = datetime.now(timezone.utc)
             if not op["cancel_sent_at"]:
                 # Persist intent before the single cooperative cancellation request.
-                await db.operation_update(
-                    op,
-                    state="cancelling",
-                    cancel_requested_at=op["cancel_requested_at"] or now,
-                    cancel_sent_at=now,
-                    error_code="MCP_INTERACTION_UNSUPPORTED"
-                    if status == "input_required"
-                    else "BACKGROUND_TIMEOUT"
-                    if expired
-                    else op["error_code"],
-                )
+                changes = {
+                    "cancel_requested_at": op["cancel_requested_at"] or now,
+                    "cancel_sent_at": now,
+                }
+                if op["state"] != "unknown":
+                    changes.update(
+                        state="cancelling",
+                        error_code="MCP_INTERACTION_UNSUPPORTED"
+                        if status == "input_required"
+                        else "BACKGROUND_TIMEOUT"
+                        if expired
+                        else op["error_code"],
+                    )
+                # Historic unknown facts may have no diagnosis. Cancellation intent
+                # must neither backfill nor replace their protected execution fields.
+                await db.operation_update(op, **changes)
                 await handle.cancel()
             elif (
                 now - op["cancel_sent_at"]
@@ -659,6 +756,7 @@ async def monitor_mcp(db, registry, op):
 async def monitor_operation(db, registry, op):
     delay = db.settings.background_poll_seconds
     try:
+        op.update(await db.monitor_record(op))
         # Leave time in the lease for persistence and disconnect cleanup.
         async with asyncio.timeout(max(0.1, db.settings.reconciliation_seconds - 2)):
             if op["backend"] == "docker":
@@ -674,17 +772,38 @@ async def monitor_operation(db, registry, op):
             else "BACKGROUND_RECONCILIATION_FAILED"
         )
         try:
-            await db.operation_update(
-                op,
-                state=op["state"] if op["state"] in OP_TERMINAL else "unknown",
-                error_code=code,
-                cleanup_state="failed",
-                cleanup_error=code,
-            )
+            if op["state"] in OP_TERMINAL:
+                await db.operation_cleanup(
+                    op, cleanup_state="failed", cleanup_error="RESOURCE_CLEANUP_FAILED"
+                )
+            else:
+                await db.operation_update(
+                    op,
+                    state="unknown",
+                    error_code=code,
+                    failure_info=failure_info(code, effect="unknown"),
+                    cleanup_state="failed",
+                    cleanup_error="RESOURCE_CLEANUP_FAILED",
+                )
         except Exception:
-            log.exception("background_diagnostic_unconfirmed")
+            log.exception(
+                "background_diagnostic_unconfirmed",
+                extra={
+                    "operation_id": op["id"],
+                    "task_id": op["task_id"],
+                    "run_id": op["run_id"],
+                    "error_code": code,
+                },
+            )
     finally:
         try:
             await db.release_monitor(op, delay)
         except Exception:
-            log.exception("background_monitor_release_unconfirmed")
+            log.exception(
+                "background_monitor_release_unconfirmed",
+                extra={
+                    "operation_id": op["id"],
+                    "task_id": op["task_id"],
+                    "run_id": op["run_id"],
+                },
+            )

@@ -4,6 +4,8 @@ import argparse
 
 import uvicorn
 
+from agent_service.logging import install_logging
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -12,8 +14,14 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("Invalid port")
+    install_logging()
     uvicorn.run(
-        "agent_service.app:app", host="127.0.0.1", port=args.port, proxy_headers=False
+        "agent_service.app:app",
+        host="127.0.0.1",
+        port=args.port,
+        proxy_headers=False,
+        log_config=None,
+        access_log=False,
     )
 
 

@@ -13,6 +13,7 @@ async def inspect():
             "execution_resources": await resources.store.resource_diagnostics(),
             "background_operations": await resources.store.operations(),
             "external_operations": await resources.store.external_operations(),
+            "unresolved": await resources.store.unresolved(),
         }
 
 

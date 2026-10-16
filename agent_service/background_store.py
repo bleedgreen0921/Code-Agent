@@ -10,6 +10,7 @@ from contracts.v1 import ErrorCode
 from langchain_core.tools import ToolException
 from agent_service.external_operations import ExternalFailure
 from agent_service.tasks import OP_TERMINAL
+from agent_service.failure import failure_info, validated_info
 
 
 def public_operation(row, *, result=True):
@@ -23,6 +24,7 @@ def public_operation(row, *, result=True):
         "created_at",
         "finished_at",
         "error_code",
+        "failure_info",
         "cleanup_state",
         "cleanup_error",
         "consumed_run_id",
@@ -119,6 +121,13 @@ class BackgroundStore:
                         >= self.settings.max_task_active_operations
                         or counts["total"] >= self.settings.max_task_operations
                     ):
+                        from agent_service.policy import active_call
+
+                        call = active_call.get()
+                        if call:
+                            call.diagnostic = failure_info(
+                                "BACKGROUND_CAPACITY_EXCEEDED", effect="not_dispatched"
+                            )
                         raise ToolException("BACKGROUND_CAPACITY_EXCEEDED")
                     identity = (
                         await (
@@ -165,6 +174,18 @@ class BackgroundStore:
                     raise ExternalFailure("BACKGROUND_DISPATCH_UNCONFIRMED") from None
 
     async def operation_update(self, operation, **changes):
+        return await self._operation_update(operation, changes, mode="ordinary")
+
+    async def operation_reconcile(self, operation, **changes):
+        """Internal authoritative observation of the ORIGINAL resource only."""
+        return await self._operation_update(operation, changes, mode="reconcile")
+
+    async def operation_cleanup(self, operation, **changes):
+        if changes.keys() - {"cleanup_state", "cleanup_error"}:
+            raise ValueError("Invalid cleanup update")
+        return await self._operation_update(operation, changes, mode="cleanup")
+
+    async def _operation_update(self, operation, changes, *, mode):
         allowed = {
             "state",
             "phase",
@@ -174,6 +195,7 @@ class BackgroundStore:
             "receipt",
             "result",
             "error_code",
+            "failure_info",
             "cleanup_state",
             "cleanup_error",
             "cancel_sent_at",
@@ -181,56 +203,85 @@ class BackgroundStore:
         }
         if not changes or changes.keys() - allowed:
             raise ValueError("Invalid operation update")
-        assignments = sql.SQL(",").join(
-            sql.SQL(
-                "state=CASE WHEN cancel_requested_at IS NOT NULL AND %s IN ('starting','running') THEN 'cancelling' ELSE %s END"
+        changes = dict(changes)
+        if changes.get("state") in OP_TERMINAL:
+            # A terminal submission describes the complete execution outcome, including
+            # absent details. Confirmation cannot silently accept a different result.
+            changes.setdefault("result", None)
+            changes.setdefault("error_code", None)
+        if "failure_info" in changes:
+            changes["failure_info"] = validated_info(changes["failure_info"])
+        elif "error_code" in changes:
+            changes["failure_info"] = (
+                failure_info(
+                    changes["error_code"],
+                    effect="unknown" if changes.get("state") == "unknown" else None,
+                )
+                if changes["error_code"]
+                else None
             )
-            if k == "state"
-            else sql.SQL("{}=%s").format(sql.Identifier(k))
-            for k in changes
-        )
-        values = []
-        for key, value in changes.items():
-            values.append(
-                Jsonb(value)
-                if key in ("receipt", "result") and value is not None
-                else value
-            )
-            if key == "state":
-                values.append(value)
         for attempt in range(3):
             try:
                 async with self.locked() as conn:
                     prior = await (
                         await conn.execute(
-                            "SELECT state,cleanup_state FROM agent.background_operations WHERE id=%s",
-                            (operation["id"],),
-                        )
-                    ).fetchone()
-                    record = await (
-                        await conn.execute(
-                            sql.SQL("""UPDATE agent.background_operations SET {},
-                        finished_at=CASE WHEN %s IN ('succeeded','failed','cancelled','unknown') THEN COALESCE(finished_at,clock_timestamp()) ELSE finished_at END
-                        WHERE id=%s AND monitor_token=%s AND monitor_until>clock_timestamp() RETURNING *""").format(
-                                assignments
-                            ),
+                            """SELECT * FROM agent.background_operations WHERE id=%s
+                            AND task_id=%s AND run_id=%s AND monitor_token=%s
+                            AND monitor_until>clock_timestamp() FOR UPDATE""",
                             (
-                                *values,
-                                changes.get("state"),
                                 operation["id"],
+                                operation["task_id"],
+                                operation["run_id"],
                                 operation["monitor_token"],
                             ),
                         )
                     ).fetchone()
-                    if not record:
+                    if not prior:
                         raise ExternalFailure("BACKGROUND_MONITOR_LEASE_LOST")
-                    if "state" in changes and prior["state"] != record["state"]:
+                    updates = guarded_changes(prior, changes, mode=mode)
+                    if prior["state"] == "unknown" and mode == "reconcile":
+                        # No scheduler or result consumption: keep the Task terminal.
+                        await self.stop_task(
+                            conn,
+                            prior["task_id"],
+                            code="BACKGROUND_RESULT_UNKNOWN",
+                        )
+                    different = {k: v for k, v in updates.items() if prior[k] != v}
+                    record = prior
+                    if different:
+                        assignments = sql.SQL(",").join(
+                            sql.SQL("{}=%s").format(sql.Identifier(k))
+                            for k in different
+                        )
+                        values = [
+                            Jsonb(v)
+                            if k in ("receipt", "result", "failure_info")
+                            and v is not None
+                            else v
+                            for k, v in different.items()
+                        ]
+                        record = await (
+                            await conn.execute(
+                                sql.SQL("""UPDATE agent.background_operations SET {},
+                                finished_at=CASE WHEN %s IN ('succeeded','failed','cancelled','unknown')
+                                THEN COALESCE(finished_at,clock_timestamp()) ELSE finished_at END
+                                WHERE id=%s RETURNING *""").format(assignments),
+                                (*values, updates.get("state"), operation["id"]),
+                            )
+                        ).fetchone()
+                    if prior["state"] != record["state"]:
                         await self.task_event(
                             conn,
                             record["task_id"],
                             "operation_" + record["state"],
                             record["error_code"],
                             record["id"],
+                        )
+                    if record["state"] == "unknown":
+                        await self.stop_task(
+                            conn,
+                            record["task_id"],
+                            code="BACKGROUND_RESULT_UNKNOWN",
                         )
                     if prior["cleanup_state"] != record["cleanup_state"]:
                         await self.task_event(
@@ -245,6 +296,35 @@ class BackgroundStore:
             except (psycopg.Error, OSError, TimeoutError):
                 if attempt == 2:
                     raise
+
+    async def monitor_record(self, operation):
+        async with self.pool.connection() as conn:
+            current = await (
+                await conn.execute(
+                    """SELECT * FROM agent.background_operations WHERE id=%s AND task_id=%s
+                AND run_id=%s AND monitor_token=%s AND monitor_until>clock_timestamp()""",
+                    (
+                        operation["id"],
+                        operation["task_id"],
+                        operation["run_id"],
+                        operation["monitor_token"],
+                    ),
+                )
+            ).fetchone()
+        if not current:
+            raise ExternalFailure("BACKGROUND_MONITOR_LEASE_LOST")
+        for key in (
+            "backend",
+            "binding",
+            "container_name",
+            "container_id",
+            "daemon_id",
+            "remote_handle",
+            "receipt",
+        ):
+            if operation[key] != current[key]:
+                raise ExternalFailure("BACKGROUND_RESOURCE_IDENTITY_CHANGED")
+        return current
 
     async def release_monitor(self, op, delay=None):
         async with self.pool.connection() as conn:
@@ -289,3 +369,43 @@ class BackgroundStore:
                     (task_id,),
                 )
             ).fetchall()
+
+
+def guarded_changes(prior, changes, *, mode="ordinary"):
+    """Apply one state contract to observations, confirmations and cleanup writes."""
+    changes = dict(changes)
+    terminal = {"succeeded", "failed", "cancelled"}
+    protected = {"state", "result", "error_code", "failure_info"}
+    for key in ("container_id", "daemon_id", "remote_handle", "receipt"):
+        if prior[key] is not None and key in changes and changes[key] != prior[key]:
+            raise ExternalFailure("BACKGROUND_RESOURCE_IDENTITY_CHANGED")
+    if (
+        prior["cleanup_state"] == "released"
+        and changes.get("cleanup_state", "released") != "released"
+    ):
+        raise ExternalFailure("BACKGROUND_STATE_CONFLICT")
+    state = prior["state"]
+    target = changes.get("state", state)
+    if state in terminal or (state == "unknown" and mode != "reconcile"):
+        if any(k in changes and changes[k] != prior[k] for k in protected):
+            raise ExternalFailure("BACKGROUND_STATE_CONFLICT")
+    elif state == "unknown":
+        if target == "unknown" and any(
+            k in changes and changes[k] != prior[k] for k in protected
+        ):
+            raise ExternalFailure("BACKGROUND_STATE_CONFLICT")
+        if target not in terminal | {"unknown"}:
+            raise ExternalFailure("BACKGROUND_STATE_CONFLICT")
+    else:
+        transitions = {
+            "starting": {"starting", "running", "cancelling", *terminal, "unknown"},
+            "running": {"running", "cancelling", *terminal, "unknown"},
+            "cancelling": {"cancelling", *terminal, "unknown"},
+        }
+        if target in {"starting", "running"} and (
+            prior["cancel_requested_at"] is not None or state == "cancelling"
+        ):
+            target = changes["state"] = "cancelling"
+        if target not in transitions[state]:
+            raise ExternalFailure("BACKGROUND_STATE_CONFLICT")
+    return changes

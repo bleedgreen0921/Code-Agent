@@ -19,8 +19,8 @@ from langchain_core.messages import ToolMessage
 from agent_service.execution_errors import (
     CommandTimeout,
     EnvironmentLost,
-    ExecutionFailure,
 )
+from agent_service.failure import failure_info, is_control
 from agent_service.output import limit_output
 from agent_service.policy import active_call
 
@@ -288,6 +288,16 @@ class ControlledShellMiddleware(ShellToolMiddleware):
 
     def _format_tool_message(self, content, tool_call_id, *, status, artifact=None):
         artifact = dict(artifact or {})
+        if status == "error":
+            code = (
+                "SHELL_COMMAND_FAILED"
+                if type(artifact.get("exit_code")) is int and artifact["exit_code"] != 0
+                else "INVALID_TOOL_ARGUMENTS"
+            )
+            artifact["failure_info"] = failure_info(code)
+            call = active_call.get()
+            if call:
+                call.diagnostic = artifact["failure_info"]
         content, truncated = limit_output(
             content, self.scope.settings.output_bytes, self.scope.settings.output_lines
         )
@@ -322,6 +332,11 @@ class WorkspaceExecutionMiddleware(AgentMiddleware):
                         content='{"code":"BACKGROUND_WORKSPACE_READ_ONLY"}',
                         tool_call_id=request.tool_call["id"],
                         status="error",
+                        artifact={
+                            "failure_info": failure_info(
+                                "BACKGROUND_WORKSPACE_READ_ONLY"
+                            )
+                        },
                     )
                 run_limited = scope.remaining() <= scope.settings.command_timeout
                 try:
@@ -347,9 +362,7 @@ class WorkspaceExecutionMiddleware(AgentMiddleware):
                 return result
         except BaseException as exc:
             # Outer Hook/ToolError middleware cannot swallow fatal execution controls.
-            if isinstance(
-                exc, (ExecutionFailure, TimeoutError, asyncio.CancelledError)
-            ):
+            if is_control(exc):
                 call = active_call.get()
                 if call:
                     call.failure = exc

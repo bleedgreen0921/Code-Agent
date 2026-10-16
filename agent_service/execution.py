@@ -12,6 +12,7 @@ from agent_service.execution_errors import (
     EnvironmentUnavailable,
     EnvironmentLost,
     CleanupFailed,
+    safe_cleanup_error,
 )
 
 LABEL = "io.agent-framework.resource"
@@ -367,7 +368,7 @@ class ExecutionScope:
                         self.row["id"],
                         self.row["lease_token"],
                         state="cleanup_failed",
-                        cleanup_error=str(exc)[:500],
+                        cleanup_error=safe_cleanup_error(exc),
                     )
             except Exception:
                 # The existing unreleased row remains authoritative if diagnostics fail.
@@ -380,7 +381,10 @@ async def cleanup_resource(store, resource, client):
         return
     daemon = await client.daemon()
     if resource["daemon_id"] and resource["daemon_id"] != daemon:
-        raise CleanupFailed("Docker daemon identity mismatch; occupancy retained")
+        raise CleanupFailed(
+            "Docker daemon identity mismatch; occupancy retained",
+            reason="identity_mismatch",
+        )
     identity = resource["container_id"] or resource["container_name"]
     inspected = await client.inspect(identity)
     if inspected:
@@ -388,7 +392,13 @@ async def cleanup_resource(store, resource, client):
         if labels.get(LABEL) != resource["container_name"] or labels.get(
             "io.agent-framework.lease"
         ) != str(resource["lease_token"]):
-            raise CleanupFailed("Container ownership labels mismatch")
+            raise CleanupFailed(
+                "Container ownership labels mismatch", reason="identity_mismatch"
+            )
+        if resource["container_id"] and inspected["Id"] != resource["container_id"]:
+            raise CleanupFailed(
+                "Container identity mismatch", reason="identity_mismatch"
+            )
         identity = inspected["Id"]
         if resource["container_id"] is None:
             # Record positive evidence before removal, so lost removal acknowledgements
@@ -409,7 +419,10 @@ async def cleanup_resource(store, resource, client):
         if await client.inspect(identity) is not None:
             raise CleanupFailed("Container removal was not confirmed")
     elif resource["phase"] == "creating" and resource["container_id"] is None:
-        raise CleanupFailed("Container creation result unknown; occupancy retained")
+        raise CleanupFailed(
+            "Container creation result unknown; occupancy retained",
+            reason="create_unknown",
+        )
 
 
 async def recover_resources(store, settings):
@@ -433,7 +446,7 @@ async def recover_resources(store, settings):
                 resource["run_id"],
                 resource["lease_token"],
                 state="cleanup_failed",
-                cleanup_error=str(exc)[:500],
+                cleanup_error=safe_cleanup_error(exc),
             )
 
 

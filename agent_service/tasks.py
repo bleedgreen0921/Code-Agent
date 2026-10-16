@@ -25,6 +25,26 @@ class TaskStore:
             "INSERT INTO agent.task_events(task_id,status,error_code,operation_id) VALUES(%s,%s,%s,%s)",
             (task_id, status, code, operation_id),
         )
+        import logging
+
+        run = None
+        if operation_id:
+            run = await (
+                await conn.execute(
+                    "SELECT run_id FROM agent.background_operations WHERE id=%s",
+                    (operation_id,),
+                )
+            ).fetchone()
+        logging.getLogger(__name__).info(
+            "background_transition" if operation_id else "task_transition",
+            extra={
+                "task_id": task_id,
+                "operation_id": operation_id,
+                "run_id": run["run_id"] if run else None,
+                "status": status,
+                "error_code": code,
+            },
+        )
 
     async def task_transition(self, conn, task_id, status, code=None, answer=None):
         row = await (
@@ -129,7 +149,7 @@ class TaskStore:
         return public_task(row), False
 
     async def task(self, task_id):
-        async with self.pool.connection() as conn:
+        async with self.snapshot() as conn:
             row = await (
                 await conn.execute("SELECT * FROM agent.tasks WHERE id=%s", (task_id,))
             ).fetchone()
@@ -141,7 +161,11 @@ class TaskStore:
                     (task_id,),
                 )
             ).fetchall()
-        return public_task(row) | {"depends_on": [d["dependency_id"] for d in deps]}
+            unresolved = await self.unresolved(task_id=task_id, conn=conn)
+        return public_task(row) | {
+            "depends_on": [d["dependency_id"] for d in deps],
+            "unresolved": unresolved,
+        }
 
     async def list_tasks(self, limit=30, cursor=None, status=None):
         from agent_service.storage import page

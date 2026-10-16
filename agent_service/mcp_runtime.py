@@ -19,6 +19,7 @@ from mcp.types import InputRequiredResult, TextContent
 from agent_service.external_operations import ExternalFailure, ExternalOperations
 from agent_service.mcp_config import MAX_MESSAGE_BYTES, contract, digest
 from agent_service.output import bounded_artifact, limit_output
+from agent_service.failure import failure_info
 from agent_service.policy import active_call
 
 
@@ -287,6 +288,7 @@ class MCPScope:
                     name=alias,
                     tool_call_id=call.call_id,
                     status="error",
+                    artifact={"failure_info": failure_info("MCP_WRITE_BATCH_REJECTED")},
                 )
             if write and call.call_id in self.seen:
                 raise ExternalFailure("MCP_REPLAY_DENIED")
@@ -302,6 +304,23 @@ class MCPScope:
                             "id": call.call_id,
                             "name": native.name,
                             "args": arguments,
+                        }
+                    )
+                if result.status == "error":
+                    info = failure_info(
+                        "MCP_WRITE_ERROR" if write else "MCP_CALL_FAILED"
+                    )
+                    call.diagnostic = info
+                    result = result.model_copy(
+                        update={
+                            "artifact": {
+                                **(
+                                    result.artifact
+                                    if isinstance(result.artifact, dict)
+                                    else {}
+                                ),
+                                "failure_info": info,
+                            }
                         }
                     )
                 if write:
@@ -383,6 +402,7 @@ class MCPBatchMiddleware(AgentMiddleware):
                 tool_call_id=call.call_id,
                 name=request.tool_call["name"],
                 status="error",
+                artifact={"failure_info": failure_info("MCP_WRITE_BATCH_REJECTED")},
             )
         return await handler(request)
 

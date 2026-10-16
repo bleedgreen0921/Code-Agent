@@ -1,0 +1,14 @@
+[
+  {
+    "id": "normalize_zero",
+    "task": "修复 candidate.py 中的 l2_normalize(x, axis=-1)。保持函数签名和 NumPy 数组返回值；沿指定 axis 对非零向量进行 L2 归一化，零向量返回全零，混合输入不能产生 NaN 或 Inf。支持默认 axis=-1 和 axis=0，不要修改输入数组。只修改 candidate.py，先读取文件，修改后调用 run_checks 验证。"
+  },
+  {
+    "id": "confusion_missing",
+    "task": "修复 candidate.py 中的 calculate_confusion_matrix(Y, Y_hat, classes)。Y 是 one-hot 真值，Y_hat 是预测得分，按 argmax 选择预测类别。保持返回 (confnorm, right, wrong)：confnorm 按真实类别逐行归一化，没有真实样本的类别行应全零；空输入形状 (0, len(classes)) 应返回全零方阵和两个 0。正常类别的统计不能改变，不能产生 NaN/Inf。只修改 candidate.py，先读取文件，修改后调用 run_checks 验证。"
+  },
+  {
+    "id": "split_variable",
+    "task": "改进 candidate.py 中的 load_data(filename)，保留原有返回结构与 one-hot 标签。输入 pickle 是 (调制类型, SNR) 到数组的字典，键组成完整笛卡尔积，每组至少 5 条样本，各组长度可不同。不要写死每组 1000 条：每组训练数 int(n*0.6)、验证数 int(n*0.2)，其余为测试。索引应覆盖所有样本、组间不越界、三个集合互不重叠，X/Y 与索引一致，重复调用划分可复现。1000 条每组的原场景仍应正确。只修改 candidate.py，先读取文件，修改后调用 run_checks 验证。"
+  }
+]

@@ -1,0 +1,44 @@
+{
+  "source_root": "/home/qjj/AMR/AMR-Benchmark",
+  "cases": [
+    {
+      "id": "normalize_zero",
+      "source_file": "RML2018/DAE/main.py",
+      "function": "l2_normalize",
+      "lines": [
+        24,
+        26
+      ],
+      "source_file_sha256": "a3775538eab6062ad00bef82df5a0dab1ad255ff49a6628027539eb7ac5502b5",
+      "function_sha256": "8a3d6495718dd93b76e32ffa5194da63861a37c598548b03b6416ee5b414425b",
+      "fixture_sha256": "3507a76b429e032fdd994805248ea328763bf4181783ea72cd2b386ba812b8cf"
+    },
+    {
+      "id": "confusion_missing",
+      "source_file": "RML201610a/CNN2/mltools.py",
+      "function": "calculate_confusion_matrix",
+      "lines": [
+        91,
+        107
+      ],
+      "source_file_sha256": "ef4506cee8da2f5bdfab20ff75d68e1b1f5170f8183ba7c19ceeccc19072e728",
+      "function_sha256": "352c272490c94cd90fc83a636c48c7170e47ee79b363526be80275d399dc3880",
+      "fixture_sha256": "a5fa35da7f538861b8b20bea1f4fb72090b5e02ab7ad0cf1c7ec4123f802f1e2"
+    },
+    {
+      "id": "split_variable",
+      "source_file": "RML201610a/CNN2/dataset2016.py",
+      "function": "load_data",
+      "lines": [
+        5,
+        60
+      ],
+      "source_file_sha256": "5fd9a9c403e61b5e0f4ae3f50694bc7e64367cc04d04d0ffcaad775ff1001e33",
+      "function_sha256": "cc321918a2995ce5820cd5f483446ea85fc59823a633280f5857f20e953a4d29",
+      "fixture_sha256": "fa8ba3e8859a3b4cb5d94e58aec952475ec807a4c25b0b70f5c3d9c72a461d5b"
+    }
+  ],
+  "source_git_head": "6a129c411b73e521fc3f04ccb8e1e58f8af71eb1",
+  "source_was_dirty": true,
+  "function_bodies_unchanged": true
+}

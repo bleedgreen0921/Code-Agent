@@ -1,6 +1,9 @@
 """CI/local entry: isolated ordinary PostgreSQL, synthetic tests, strict reports."""
 
 import argparse
+import hashlib
+import importlib.metadata
+import platform
 import json
 import os
 import secrets
@@ -81,18 +84,88 @@ def main():
         project,
     ]
 
+    log_path = output / "integration.log"
+    print(f"Integration evidence: {output}", flush=True)
+    metadata = {
+        "revision": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+        ).strip(),
+        "dirty": bool(
+            subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT)
+        ),
+        "python": platform.python_version(),
+        "dependency_lock_sha256": hashlib.sha256(
+            (ROOT / "requirements.lock").read_bytes()
+        ).hexdigest(),
+        "dependencies": {
+            name: importlib.metadata.version(name)
+            for name in (
+                "langchain",
+                "langgraph",
+                "langgraph-checkpoint-postgres",
+                "mcp",
+                "fastmcp-slim",
+                "fastmcp-tasks",
+                "psycopg",
+                "pydantic",
+            )
+        },
+        "sources": {
+            str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for directory in ("agent_service", "db", "execution", "scripts", "tests")
+            for p in sorted((ROOT / directory).rglob("*"))
+            if p.is_file()
+            and (p.suffix in (".py", ".sql", ".json") or p.name == "Dockerfile")
+        },
+        "checks": [],
+    }
+
     def command(argv, timeout=120):
-        subprocess.run(argv, cwd=ROOT, env=env, check=True, timeout=timeout)
+        with log_path.open("a") as log:
+            subprocess.run(
+                argv,
+                cwd=ROOT,
+                env=env,
+                check=True,
+                timeout=timeout,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+
+    def containers():
+        return set(
+            subprocess.check_output(
+                [
+                    "docker",
+                    "ps",
+                    "-aq",
+                    "--filter",
+                    "label=io.agent-framework.resource",
+                ],
+                text=True,
+            ).split()
+        )
+
+    before_containers = containers()
 
     try:
         # All tests use a prebuilt immutable image. Runs never pull/build/install.
         from scripts.build_execution_image import build
 
-        env["AGENT_TEST_EXECUTION_IMAGE"] = build()
+        with log_path.open("a") as log:
+            env["AGENT_TEST_EXECUTION_IMAGE"] = build(output=log)
+        metadata["execution_image"] = env["AGENT_TEST_EXECUTION_IMAGE"]
         command(compose + ["up", "-d", "--wait"], timeout=300)
+        metadata["postgres_image"] = subprocess.check_output(
+            ["docker", "inspect", "--format", "{{.Image}}", project + "-postgres-1"],
+            text=True,
+        ).strip()
         command([sys.executable, "-m", "db.migrate"])
+        metadata["checks"].append("core_0006 migration passed")
         command([sys.executable, "-m", "db.bootstrap"])
+        metadata["checks"].append("runtime bootstrap passed")
         command([sys.executable, "-m", "db.doctor", "--json"])
+        metadata["checks"].append("readiness and read-only doctor passed")
         report = output / "pytest.xml"
         command(
             [
@@ -107,6 +180,7 @@ def main():
         )
         counts = validate_report(report)
         (output / "summary.json").write_text(json.dumps(counts, indent=2))
+        metadata["tests"] = counts
         print(json.dumps(counts), flush=True)
     finally:
         if args.keep_db:
@@ -131,6 +205,11 @@ def main():
             print(f"Test database retained; credentials: {credentials}")
         else:
             command(compose + ["down", "-v", "--remove-orphans"])
+        metadata["database_retained"] = args.keep_db
+        metadata["new_unreleased_containers"] = sorted(containers() - before_containers)
+        (output / "metadata.json").write_text(json.dumps(metadata, indent=2))
+        if metadata["new_unreleased_containers"]:
+            raise RuntimeError("Integration resources remain; inspect metadata.json")
 
 
 if __name__ == "__main__":
