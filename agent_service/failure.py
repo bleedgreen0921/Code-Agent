@@ -210,6 +210,15 @@ _register(
 )
 
 
+_register(
+    "BACKGROUND_OBSERVATION_EXHAUSTED BACKGROUND_OBSERVATION_INTERRUPTED BACKGROUND_OBSERVATION_TRANSIENT MCP_CANCEL_TRANSPORT_FAILED",
+    "transport",
+    "unknown",
+    "reconcile_original",
+    "Original resource observation or cancellation is not confirmed.",
+)
+
+
 def failure_info(code="EXECUTION_FAILED", *, effect=None, recovery=None):
     code = code if code in SPECS else "EXECUTION_FAILED"
     category, default_effect, default_recovery, message = SPECS[code]

@@ -64,4 +64,25 @@ class DiagnosticStore:
                 (run_id, run_id, task_id, task_id, list(SPECS), list(SPECS)),
             )
         ).fetchone()
+        ids = [
+            record["id"]
+            for record in row["records"]
+            if record["kind"] == "background_operation"
+        ]
+        if ids:
+            from agent_service.background_store import operation_diagnostics
+
+            diagnostics = await (
+                await conn.execute(
+                    "SELECT * FROM agent.background_operations WHERE id=ANY(%s::uuid[])",
+                    (ids,),
+                )
+            ).fetchall()
+            by_id = {
+                str(item["id"]): operation_diagnostics(item) for item in diagnostics
+            }
+            # The same read-only repeatable-read transaction owns both projections.
+            for record in row["records"]:
+                if record["kind"] == "background_operation":
+                    record.update(by_id[str(record["id"])])
         return row

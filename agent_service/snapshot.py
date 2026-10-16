@@ -28,6 +28,7 @@ def runtime_snapshot(model, settings, registry, binding, middleware):
     profile = registry.resolve(binding)
     return {
         "version": 1,
+        "reliability": registry.reliability.model_dump(),
         **(
             {"knowledge": knowledge_manifest()}
             if set(profile.tools) & {"knowledge_get", "knowledge_search"}

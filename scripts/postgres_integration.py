@@ -161,7 +161,7 @@ def main():
             text=True,
         ).strip()
         command([sys.executable, "-m", "db.migrate"])
-        metadata["checks"].append("core_0006 migration passed")
+        metadata["checks"].append("core_0007 migration passed")
         command([sys.executable, "-m", "db.bootstrap"])
         metadata["checks"].append("runtime bootstrap passed")
         command([sys.executable, "-m", "db.doctor", "--json"])

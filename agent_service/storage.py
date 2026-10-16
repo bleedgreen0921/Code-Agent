@@ -39,7 +39,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
             revisions = await (
                 await conn.execute("SELECT version_num FROM agent.alembic_version")
             ).fetchall()
-            if revisions != [{"version_num": "core_0006"}]:
+            if revisions != [{"version_num": "core_0007"}]:
                 raise RuntimeError("Core database baseline required")
             await conn.execute("SELECT 1 FROM agent.checkpoints LIMIT 1")
             await conn.execute("SELECT 1 FROM agent.store LIMIT 1")
@@ -55,7 +55,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
                     signature[key] = [list(r.values()) for r in rows]
             if (
                 signature
-                != json.loads((ROOT / "structure.json").read_text())["core_0006"]
+                != json.loads((ROOT / "structure.json").read_text())["core_0007"]
             ):
                 raise RuntimeError("Core structure mismatch")
             from langgraph.store.postgres import PostgresStore
@@ -520,6 +520,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
             if row.get("task_id"):
                 await self.task_transition(conn, row["task_id"], "running")
             await self.event(conn, row["id"], "running")
+        row["_execution_reserved"] = bool(root)
         return row
 
     async def execution_resource(self, run_id):
@@ -604,17 +605,17 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
                 FROM agent.execution_resources WHERE state<>'released' ORDER BY created_at""")
             ).fetchall()
 
-    async def renew(self, run_id, token):
+    async def renew(self, run_id, token, *, with_lease=False):
         async with self.pool.connection() as conn:
             row = await (
                 await conn.execute(
                     """UPDATE agent.runs SET lease_until=clock_timestamp()+%s*interval '1 second'
                 WHERE id=%s AND lease_token=%s AND status IN ('running','cancelling')
-                AND lease_until>clock_timestamp() AND deadline_at>clock_timestamp() RETURNING status""",
+                AND lease_until>clock_timestamp() AND deadline_at>clock_timestamp() RETURNING status,lease_until""",
                     (self.settings.lease_seconds, run_id, token),
                 )
             ).fetchone()
-        return row["status"] if row else None
+        return row if with_lease else row["status"] if row else None
 
     async def record_runtime_config(self, run_id, token, snapshot):
         """Persist once under a valid lease. Repeats confirm the identical snapshot."""

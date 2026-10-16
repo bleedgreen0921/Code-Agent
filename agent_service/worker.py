@@ -5,11 +5,13 @@ import json
 import logging
 import signal
 from contextlib import suppress
+from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 
 import psycopg
 from langchain_core.messages import HumanMessage
 
+from agent_service.reliability import remaining_execution, transient_database, backoff
 from agent_service.failure import failure_info, control_leaf, exception_code
 from agent_service.resources import Resources
 from agent_service.execution import ExecutionScope, recover_resources, check_environment
@@ -39,6 +41,10 @@ from agent_service.delegation import (
 )
 
 log = logging.getLogger(__name__)
+
+
+class MaintenanceBudgetExpired(TimeoutError):
+    pass
 
 
 class IncompleteGraphError(RuntimeError):
@@ -212,6 +218,8 @@ class Worker:
             workspace_identity=binding["workspace_identity"],
             binding_fingerprint=binding["fingerprint"],
             deadline_at=row["deadline_at"],
+            effective_deadline_at=row.get("effective_deadline_at"),
+            execution_authority=row,
             task_id=str(row["task_id"]) if row.get("task_id") else None,
             task_store=self.db if row.get("task_id") else None,
             result_delivery=row.setdefault("_delivery_candidates", {})
@@ -224,7 +232,9 @@ class Worker:
         return graph, context
 
     async def generate(self, row, scope=None):
+        remaining_execution(row)
         graph, context = await self.prepare(row, scope)
+        remaining_execution(context)
         messages = []
         if row["previous_run_id"]:
             prior = await self.db.get(row["previous_run_id"])
@@ -278,6 +288,7 @@ class Worker:
             ]
         config = run_config(row["id"])
         config["callbacks"] = [row["_reported_usage"]]
+        remaining_execution(context)
         state = await graph.ainvoke(
             {"messages": [*messages, HumanMessage(content=row["task"])]},
             config,
@@ -341,7 +352,7 @@ class Worker:
     async def execute(self, row):
         scope = (
             ExecutionScope(self.db, row, self.resources.registry.execution)
-            if await self.db.execution_resource(row["id"])
+            if row.get("_execution_reserved", False)
             else None
         )
         from agent_service.mcp_runtime import MCPScope
@@ -355,6 +366,15 @@ class Worker:
                 )
         except ConfigurationChanged:
             pass  # prepare publishes the established configuration error.
+        registry = self.resources.registry
+        cleanup_budget = (registry.execution.cleanup_timeout if scope else 0) + (
+            registry.mcp.cleanup_timeout if mcp_scope else 0
+        )
+        publication_reserve = registry.reliability.publication_reserve
+        row["effective_deadline_at"] = row["deadline_at"] - timedelta(
+            seconds=cleanup_budget + publication_reserve
+        )
+        row["_lease_until"] = row["lease_until"]
         work = asyncio.create_task(self.generate(row, scope))
         lost = False
         cancelled = False
@@ -367,11 +387,15 @@ class Worker:
             while True:
                 await asyncio.sleep(self.settings.heartbeat_seconds)
                 try:
-                    status = await self.db.renew(row["id"], row["lease_token"])
+                    confirmation = await self.db.renew(
+                        row["id"], row["lease_token"], with_lease=True
+                    )
+                    status = confirmation["status"] if confirmation else None
+                    if confirmation:
+                        row["_lease_until"] = confirmation["lease_until"]
                     if status is None:
                         lost = True
                         abort.set()
-                        await self.db.maintain()
                     elif status == "cancelling":
                         cancelled = True
                         abort.set()
@@ -382,12 +406,33 @@ class Worker:
                         extra={"run_id": row["id"], "task_id": row.get("task_id")},
                     )
 
+        async def supervise_lease():
+            nonlocal lost
+            while True:
+                remaining = (
+                    row["_lease_until"] - datetime.now(timezone.utc)
+                ).total_seconds()
+                if remaining <= 0:
+                    lost = True
+                    abort.set()
+                    return
+                await asyncio.sleep(min(remaining, self.settings.heartbeat_seconds))
+
         heartbeat = asyncio.create_task(renew())
+        lease_guard = asyncio.create_task(supervise_lease())
         interrupt = asyncio.create_task(abort.wait())
         try:
             done, _ = await asyncio.wait(
                 {work, interrupt},
-                timeout=float(row["remaining"]),
+                timeout=max(
+                    0,
+                    min(
+                        float(row["remaining"]),
+                        (
+                            row["effective_deadline_at"] - datetime.now(timezone.utc)
+                        ).total_seconds(),
+                    ),
+                ),
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if lost or cancelled:
@@ -411,6 +456,7 @@ class Worker:
                 },
             )
         finally:
+            row["_execution_closed"] = True
             # Freeze admissions before cancelling graph work; executor threads cannot respawn.
             if mcp_scope:
                 mcp_scope.closing = True
@@ -419,7 +465,22 @@ class Worker:
                     scope.closing = True
             if not work.done():
                 work.cancel()
-            await asyncio.gather(work, return_exceptions=True)
+            loop = asyncio.get_running_loop()
+            cleanup_deadline = min(
+                loop.time() + cleanup_budget,
+                loop.time()
+                + max(
+                    0,
+                    (row["deadline_at"] - datetime.now(timezone.utc)).total_seconds()
+                    - publication_reserve,
+                ),
+            )
+            # asyncio.wait bounds a graph that is slow to honour cancellation.
+            await asyncio.wait({work}, timeout=max(0, cleanup_deadline - loop.time()))
+            graph_stopped = work.done()
+            if graph_stopped:
+                with suppress(BaseException):
+                    work.result()
             if usage := row.get("_reported_usage"):
                 log.info(
                     "run_reported_usage",
@@ -430,26 +491,153 @@ class Worker:
                         ),
                     },
                 )
+
+            async def close_resource(resource):
+                if resource is None:
+                    return True
+                try:
+                    async with asyncio.timeout_at(cleanup_deadline):
+                        return await resource.close(cleanup_deadline)
+                except Exception:
+                    log.exception(
+                        "run_cleanup_unconfirmed", extra={"run_id": row["id"]}
+                    )
+                    return False
+
             try:
-                mcp_clean = await mcp_scope.close() if mcp_scope else True
-                clean = await scope.close() if scope else True
-                clean = clean and mcp_clean
+                mcp_clean = await close_resource(mcp_scope)
+                clean = await close_resource(scope)
+                clean = clean and mcp_clean and graph_stopped
                 if not clean and not result.get("error_code"):
                     result = {"error_code": "RESOURCE_CLEANUP_FAILED"}
+                if lost:
+                    # Publish no result, but allow the existing DB expiry rules to
+                    # close the Run when maintenance is available in this process.
+                    try:
+                        async with asyncio.timeout(publication_reserve):
+                            await self.db.maintain()
+                    except Exception:
+                        log.exception(
+                            "lease_renewal_unconfirmed", extra={"run_id": row["id"]}
+                        )
                 if not lost:
-                    await self.publish(
-                        row, **({"cancelled": True} if cancelled else result)
+                    seconds = max(
+                        0,
+                        min(
+                            publication_reserve,
+                            (
+                                row["deadline_at"] - datetime.now(timezone.utc)
+                            ).total_seconds(),
+                        ),
                     )
+                    try:
+                        async with asyncio.timeout(seconds):
+                            await self.publish(
+                                row, **({"cancelled": True} if cancelled else result)
+                            )
+                    except TimeoutError:
+                        log.error(
+                            "result_publication_unconfirmed",
+                            extra={"run_id": row["id"]},
+                        )
             finally:
                 heartbeat.cancel()
+                lease_guard.cancel()
                 interrupt.cancel()
-                await asyncio.gather(heartbeat, interrupt, return_exceptions=True)
+                await asyncio.gather(
+                    heartbeat, lease_guard, interrupt, return_exceptions=True
+                )
         if shutdown:
             raise asyncio.CancelledError
 
+    async def maintenance_phase(self, limit):
+        async def phase():
+            await self.db.heartbeat(self.id)
+            await self.db.maintain()
+
+        pending = asyncio.create_task(phase())
+        stop = asyncio.create_task(self.stopping.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {pending, stop}, timeout=limit, return_when=asyncio.FIRST_COMPLETED
+            )
+            if stop in done:
+                return False
+            if pending not in done:
+                raise MaintenanceBudgetExpired()
+            await pending
+            return True
+        finally:
+            pending.cancel()
+            stop.cancel()
+            await asyncio.wait({pending, stop}, timeout=min(0.2, max(0, limit)))
+
+            # Consume late failures without waiting beyond the maintenance budget.
+            def consume(task):
+                if not task.cancelled():
+                    task.exception()
+
+            pending.add_done_callback(consume)
+
+    async def maintain(self):
+        """Only maintenance DB transport failures own this finite recovery window."""
+        policy = self.resources.registry.reliability
+        loop = asyncio.get_running_loop()
+        failures = 0
+        first = None
+        while not self.stopping.is_set():
+            try:
+                limit = (
+                    policy.maintenance_window
+                    if first is None
+                    else max(0, first + policy.maintenance_window - loop.time())
+                )
+                return await self.maintenance_phase(limit)
+            except Exception as exc:
+                if not transient_database(exc) and not isinstance(
+                    exc, MaintenanceBudgetExpired
+                ):
+                    raise
+                if isinstance(exc, MaintenanceBudgetExpired):
+                    first = (
+                        first
+                        if first is not None
+                        else loop.time() - policy.maintenance_window
+                    )
+                failures += 1
+                first = first if first is not None else loop.time()
+                remaining = first + policy.maintenance_window - loop.time()
+                if failures >= policy.maintenance_max_failures or remaining <= 0:
+                    self.stopping.set()
+                    log.error(
+                        "worker_maintenance_exhausted",
+                        extra={"recovery_attempts": failures},
+                    )
+                    raise RuntimeError(
+                        "Worker maintenance recovery exhausted"
+                    ) from None
+                delay = min(
+                    remaining,
+                    backoff(
+                        failures,
+                        policy.maintenance_backoff_base,
+                        policy.maintenance_backoff_cap,
+                    ),
+                )
+                log.info(
+                    "worker_maintenance_retry",
+                    extra={
+                        "recovery_attempts": failures,
+                        "recovery_phase": "maintenance",
+                    },
+                )
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(self.stopping.wait(), delay)
+        return False
+
     async def tick(self):
-        await self.db.heartbeat(self.id)
-        await self.db.maintain()
+        if not await self.maintain():
+            return
         await recover_resources(self.db, self.resources.registry.execution)
         from agent_service.background import monitor_operation
 
@@ -493,7 +681,15 @@ class Worker:
             for task in self.monitors.values():
                 task.cancel()
             await asyncio.gather(*self.monitors.values(), return_exceptions=True)
-            await self.db.heartbeat(self.id, stopped=True)
+            try:
+                async with asyncio.timeout(
+                    min(2, self.resources.registry.reliability.publication_reserve)
+                ):
+                    await self.db.heartbeat(self.id, stopped=True)
+            except Exception:
+                log.exception(
+                    "lease_renewal_unconfirmed", extra={"recovery_phase": "shutdown"}
+                )
 
 
 def failure_code(exc):

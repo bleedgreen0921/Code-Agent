@@ -31,7 +31,35 @@ def public_operation(row, *, result=True):
     ]
     if result:
         keys.append("result")
-    return {k: row[k] for k in keys}
+    return {k: row[k] for k in keys} | operation_diagnostics(row)
+
+
+def operation_diagnostics(row):
+    return {
+        "observation": {
+            k: row.get(k)
+            for k in (
+                "observation_failures",
+                "observation_first_failed_at",
+                "last_observed_at",
+                "last_observation_error",
+                "next_poll_at",
+                "remote_poll_interval_ms",
+                "remote_poll_not_before",
+            )
+        },
+        "cancellation": {
+            k: row.get(k)
+            for k in (
+                "cancel_requested_at",
+                "cancel_sent_at",
+                "cancel_attempts",
+                "cancel_attempted_at",
+                "cancel_acknowledged_at",
+                "cancel_last_error",
+            )
+        },
+    }
 
 
 class BackgroundStore:
@@ -82,6 +110,12 @@ class BackgroundStore:
     async def reserve_operation(
         self, row, call_id, backend, arguments_hash, binding, *, workspace_root=None
     ):
+        from agent_service.reliability import background_policy
+
+        binding = {
+            **binding,
+            "reliability": background_policy(self.registry, self.settings),
+        }
         oid, dispatch, token = uuid4(), uuid4(), uuid4()
         for attempt in range(3):
             try:
@@ -239,6 +273,23 @@ class BackgroundStore:
                     if not prior:
                         raise ExternalFailure("BACKGROUND_MONITOR_LEASE_LOST")
                     updates = guarded_changes(prior, changes, mode=mode)
+                    if changes.get("receipt") is not None and prior["receipt"] is None:
+                        from datetime import timedelta
+                        from agent_service.reliability import poll_interval
+
+                        interval = poll_interval(
+                            changes["receipt"].get("pollIntervalMs")
+                        )
+                        now = (
+                            await (
+                                await conn.execute("SELECT clock_timestamp() AS now")
+                            ).fetchone()
+                        )["now"]
+                        updates.update(
+                            remote_poll_interval_ms=interval,
+                            remote_poll_not_before=now
+                            + timedelta(milliseconds=interval or 0),
+                        )
                     if prior["state"] == "unknown" and mode == "reconcile":
                         # No scheduler or result consumption: keep the Task terminal.
                         await self.stop_task(
@@ -330,12 +381,12 @@ class BackgroundStore:
         async with self.pool.connection() as conn:
             await conn.execute(
                 """UPDATE agent.background_operations SET monitor_until=NULL,monitor_token=NULL,
-                next_poll_at=clock_timestamp()+%s*interval '1 second' WHERE id=%s AND monitor_token=%s""",
-                (
-                    self.settings.background_poll_seconds if delay is None else delay,
-                    op["id"],
-                    op["monitor_token"],
-                ),
+                next_poll_at=CASE WHEN %s::double precision IS NULL THEN next_poll_at
+                ELSE LEAST(GREATEST(COALESCE(remote_poll_not_before,clock_timestamp()),
+                    clock_timestamp()+%s*interval '1 second'),
+                    CASE WHEN state IN ('starting','running','cancelling') THEN deadline_at ELSE 'infinity'::timestamptz END) END
+                WHERE id=%s AND monitor_token=%s""",
+                (delay, delay, op["id"], op["monitor_token"]),
             )
 
     async def claim_operations(self):
@@ -349,6 +400,87 @@ class BackgroundStore:
             result = []
             for row in rows:
                 token = uuid4()
+                if row["observation_inflight"]:
+                    from agent_service.reliability import backoff
+                    from datetime import timedelta
+
+                    from agent_service.reliability import ReliabilitySettings
+
+                    frozen = row["binding"].get("reliability")
+                    policy = (
+                        ReliabilitySettings.model_validate(
+                            {k: frozen[k] for k in ReliabilitySettings.model_fields}
+                        )
+                        if frozen
+                        else self.registry.reliability
+                    )
+                    now = (
+                        await (
+                            await conn.execute("SELECT clock_timestamp() AS now")
+                        ).fetchone()
+                    )["now"]
+                    failures = row["observation_failures"] + 1
+                    first = (
+                        row["observation_first_failed_at"]
+                        or row["observation_started_at"]
+                    )
+                    delay = backoff(
+                        failures,
+                        policy.observation_backoff_base,
+                        policy.observation_backoff_cap,
+                    )
+                    wakeup = max(
+                        now
+                        + timedelta(
+                            seconds=max(delay, self.settings.background_poll_seconds)
+                        ),
+                        row["remote_poll_not_before"] or now,
+                    )
+                    if row["state"] not in OP_TERMINAL:
+                        wakeup = min(
+                            wakeup, first + timedelta(seconds=policy.observation_window)
+                        )
+                    await conn.execute(
+                        """UPDATE agent.background_operations SET observation_inflight=false,
+                        observation_failures=%s,observation_first_failed_at=%s,last_observation_error=%s,
+                        next_poll_at=%s WHERE id=%s""",
+                        (
+                            failures,
+                            first,
+                            Jsonb(failure_info("BACKGROUND_OBSERVATION_INTERRUPTED")),
+                            wakeup,
+                            row["id"],
+                        ),
+                    )
+                    if row["state"] != "unknown" and (
+                        failures >= policy.observation_max_failures
+                        or now >= first + timedelta(seconds=policy.observation_window)
+                    ):
+                        changes = self._observation_exhausted(row, now)
+                        assignments = sql.SQL(",").join(
+                            sql.SQL("{}=%s").format(sql.Identifier(k)) for k in changes
+                        )
+                        values = [
+                            Jsonb(v) if k == "failure_info" and v is not None else v
+                            for k, v in changes.items()
+                        ]
+                        await conn.execute(
+                            sql.SQL(
+                                "UPDATE agent.background_operations SET {} WHERE id=%s"
+                            ).format(assignments),
+                            (*values, row["id"]),
+                        )
+                        if changes.get("state") == "unknown":
+                            await self.task_event(
+                                conn,
+                                row["task_id"],
+                                "operation_unknown",
+                                "BACKGROUND_OBSERVATION_EXHAUSTED",
+                                row["id"],
+                            )
+                        await self.stop_task(
+                            conn, row["task_id"], code="BACKGROUND_RESULT_UNKNOWN"
+                        )
                 result.append(
                     await (
                         await conn.execute(
@@ -359,6 +491,347 @@ class BackgroundStore:
                     ).fetchone()
                 )
         return result
+
+    async def _monitor_write(self, operation, changes_for):
+        """Retry only the transaction; callbacks are pure and never perform external I/O."""
+        from agent_service.reliability import transient_database
+
+        for attempt in range(3):
+            try:
+                async with self.locked() as conn:
+                    prior = await (
+                        await conn.execute(
+                            """SELECT *,clock_timestamp() AS db_now FROM agent.background_operations
+                        WHERE id=%s AND task_id=%s AND run_id=%s AND monitor_token=%s
+                        AND monitor_until>clock_timestamp() FOR UPDATE""",
+                            (
+                                operation["id"],
+                                operation["task_id"],
+                                operation["run_id"],
+                                operation["monitor_token"],
+                            ),
+                        )
+                    ).fetchone()
+                    if not prior:
+                        raise ExternalFailure("BACKGROUND_MONITOR_LEASE_LOST")
+                    changes = guarded_changes(prior, changes_for(prior))
+                    if changes:
+                        assignments = sql.SQL(",").join(
+                            sql.SQL("{}=%s").format(sql.Identifier(k)) for k in changes
+                        )
+                        values = [
+                            Jsonb(v)
+                            if k
+                            in {
+                                "last_observation_error",
+                                "cancel_last_error",
+                                "failure_info",
+                            }
+                            and v is not None
+                            else v
+                            for k, v in changes.items()
+                        ]
+                        record = await (
+                            await conn.execute(
+                                sql.SQL(
+                                    "UPDATE agent.background_operations SET {} WHERE id=%s RETURNING *"
+                                ).format(assignments),
+                                (*values, operation["id"]),
+                            )
+                        ).fetchone()
+                        if prior["state"] != record["state"]:
+                            await self.task_event(
+                                conn,
+                                prior["task_id"],
+                                "operation_" + record["state"],
+                                record["error_code"],
+                                record["id"],
+                            )
+                        if (
+                            record["state"] == "unknown"
+                            or changes.get("cleanup_state") == "failed"
+                        ):
+                            await self.stop_task(
+                                conn, prior["task_id"], code="BACKGROUND_RESULT_UNKNOWN"
+                            )
+                    else:
+                        record = prior
+                operation.update(record)
+                return record
+            except Exception as exc:
+                if not transient_database(exc) or attempt == 2:
+                    raise
+
+    def _observation_exhausted(self, prior, now):
+        from datetime import timedelta
+
+        policy = self.registry.reliability
+        if prior["cleanup_state"] == "released":
+            return {
+                "next_poll_at": now + timedelta(seconds=policy.cleanup_backoff_base)
+            }
+        if prior["state"] in {"succeeded", "failed", "cancelled", "unknown"}:
+            return {
+                "cleanup_state": "failed",
+                "cleanup_error": "BACKGROUND_OBSERVATION_EXHAUSTED",
+                "next_poll_at": max(
+                    now + timedelta(seconds=policy.cleanup_backoff_base),
+                    prior["remote_poll_not_before"] or now,
+                ),
+            }
+        return {
+            "state": "unknown",
+            "error_code": "BACKGROUND_OBSERVATION_EXHAUSTED",
+            "failure_info": failure_info("BACKGROUND_OBSERVATION_EXHAUSTED"),
+            "finished_at": prior["finished_at"] or now,
+            "cleanup_state": "failed",
+            "cleanup_error": "BACKGROUND_OBSERVATION_EXHAUSTED",
+            "next_poll_at": max(
+                now + timedelta(seconds=policy.cleanup_backoff_base),
+                prior["remote_poll_not_before"] or now,
+            ),
+        }
+
+    async def begin_observation(self, operation):
+        """Start one round, or handle a due budget event without making a remote call."""
+        from datetime import timedelta
+
+        policy = self.registry.reliability
+
+        def changes(prior):
+            now = prior["db_now"]
+            if prior["observation_inflight"]:
+                return {}  # Identical begin commit acknowledgement was lost.
+            if (
+                prior["state"] not in OP_TERMINAL
+                and prior["cancel_sent_at"] is not None
+                and now
+                >= prior["cancel_sent_at"]
+                + timedelta(seconds=self.settings.reconciliation_seconds)
+            ):
+                return {
+                    "state": "unknown",
+                    "error_code": "MCP_CANCEL_UNCONFIRMED",
+                    "failure_info": failure_info("MCP_CANCEL_UNCONFIRMED"),
+                    "finished_at": prior["finished_at"] or now,
+                    "next_poll_at": max(
+                        now + timedelta(seconds=policy.cleanup_backoff_base),
+                        prior["remote_poll_not_before"] or now,
+                    ),
+                }
+            exhausted = prior[
+                "observation_failures"
+            ] >= policy.observation_max_failures or (
+                prior["observation_first_failed_at"] is not None
+                and now
+                >= prior["observation_first_failed_at"]
+                + timedelta(seconds=policy.observation_window)
+            )
+            if exhausted and (
+                prior["state"] not in OP_TERMINAL
+                or (
+                    prior["state"] != "unknown"
+                    and prior["cleanup_error"] != "BACKGROUND_OBSERVATION_EXHAUSTED"
+                )
+            ):
+                return self._observation_exhausted(prior, now)
+            if prior["next_poll_at"] > now:
+                return {}
+            if (
+                prior["remote_poll_not_before"]
+                and prior["remote_poll_not_before"] > now
+            ):
+                if prior["state"] not in OP_TERMINAL and prior["deadline_at"] <= now:
+                    return {
+                        "state": "unknown",
+                        "error_code": "BACKGROUND_TIMEOUT",
+                        "failure_info": failure_info("BACKGROUND_TIMEOUT"),
+                        "finished_at": prior["finished_at"] or now,
+                        "next_poll_at": prior["remote_poll_not_before"],
+                    }
+                wakeup = prior["remote_poll_not_before"]
+                if prior["state"] not in OP_TERMINAL:
+                    deadlines = [prior["deadline_at"]]
+                    if prior["observation_first_failed_at"]:
+                        deadlines.append(
+                            prior["observation_first_failed_at"]
+                            + timedelta(seconds=policy.observation_window)
+                        )
+                    if prior["cancel_sent_at"]:
+                        deadlines.append(
+                            prior["cancel_sent_at"]
+                            + timedelta(seconds=self.settings.reconciliation_seconds)
+                        )
+                    wakeup = min(wakeup, *deadlines)
+                return {"next_poll_at": wakeup}
+            return {"observation_started_at": now, "observation_inflight": True}
+
+        record = await self._monitor_write(operation, changes)
+        return bool(record["observation_inflight"])
+
+    async def finish_observation(self, operation, *, error=None, delay=None):
+        """Confirm the entire round once, including its budget and durable wakeup."""
+        from datetime import timedelta
+        from agent_service.reliability import backoff
+
+        policy = self.registry.reliability
+        started = operation["observation_started_at"]
+        jitter = backoff(
+            operation["observation_failures"] + 1,
+            policy.cleanup_backoff_base
+            if operation["state"] in OP_TERMINAL
+            else policy.observation_backoff_base,
+            policy.cleanup_backoff_cap
+            if operation["state"] in OP_TERMINAL
+            else policy.observation_backoff_cap,
+        )
+        error = validated_info(error)
+
+        def changes(prior):
+            if prior["observation_started_at"] != started:
+                raise ExternalFailure("BACKGROUND_STATE_CONFLICT")
+            if not prior["observation_inflight"]:
+                return {}  # Full transaction already committed; never debit twice.
+            now = prior["db_now"]
+            updates = {"observation_inflight": False}
+            remote = prior["remote_poll_not_before"] or now
+            if error is None:
+                updates.update(
+                    observation_failures=0,
+                    observation_first_failed_at=None,
+                    last_observation_error=None,
+                    last_observed_at=now,
+                )
+                local = (
+                    policy.cleanup_backoff_base
+                    if prior["state"] == "unknown"
+                    else (delay or self.settings.background_poll_seconds)
+                )
+                wakeup = max(now + timedelta(seconds=local), remote)
+            else:
+                failures = prior["observation_failures"] + 1
+                first = prior["observation_first_failed_at"] or now
+                updates.update(
+                    observation_failures=failures,
+                    observation_first_failed_at=first,
+                    last_observation_error=error,
+                )
+                end = first + timedelta(seconds=policy.observation_window)
+                wakeup = max(
+                    now
+                    + timedelta(
+                        seconds=max(jitter, self.settings.background_poll_seconds)
+                    ),
+                    remote,
+                )
+                if prior["state"] not in OP_TERMINAL and (
+                    failures >= policy.observation_max_failures or now >= end
+                ):
+                    updates.update(self._observation_exhausted(prior, now))
+                    wakeup = max(updates["next_poll_at"], remote)
+                elif prior["state"] not in OP_TERMINAL:
+                    wakeup = min(
+                        wakeup, end
+                    )  # Expiry wakeup never authorizes an early remote query.
+                elif prior["state"] != "unknown" and (
+                    failures >= policy.observation_max_failures or now >= end
+                ):
+                    updates.update(self._observation_exhausted(prior, now))
+            if prior["state"] not in OP_TERMINAL and prior["deadline_at"] > now:
+                wakeup = min(wakeup, prior["deadline_at"])
+            if prior["state"] not in OP_TERMINAL and prior["cancel_sent_at"]:
+                wakeup = min(
+                    wakeup,
+                    prior["cancel_sent_at"]
+                    + timedelta(seconds=self.settings.reconciliation_seconds),
+                )
+            updates["next_poll_at"] = wakeup
+            return updates
+
+        return await self._monitor_write(operation, changes)
+
+    async def remote_poll(self, operation, interval_ms):
+        from datetime import timedelta
+        from agent_service.reliability import poll_interval
+
+        interval_ms = poll_interval(interval_ms)
+        previous = operation["remote_poll_not_before"]
+
+        def changes(prior):
+            if prior["remote_poll_not_before"] != previous:
+                return {}  # This status response's interval already committed.
+            return {
+                "remote_poll_interval_ms": interval_ms,
+                "remote_poll_not_before": prior["db_now"]
+                + timedelta(milliseconds=interval_ms or 0),
+            }
+
+        return await self._monitor_write(operation, changes)
+
+    async def reserve_cancel_attempt(self, operation, attempt_id):
+        """The occupied attempt survives a crash even if handle.cancel was never sent."""
+        from datetime import timedelta
+
+        policy = self.registry.reliability
+        safe = (
+            operation["binding"]
+            .get("manifest", {})
+            .get("tool", {})
+            .get("cancel_retry_safe")
+            is True
+        )
+
+        def changes(prior):
+            if prior["cancel_attempt_id"] == attempt_id:
+                return {}
+            now = prior["db_now"]
+            first = prior["cancel_sent_at"]
+            can_retry = (
+                safe
+                and prior["cancel_last_error"]
+                and prior["cancel_last_error"]["code"] == "MCP_CANCEL_TRANSPORT_FAILED"
+            )
+            if (
+                prior["cancel_acknowledged_at"]
+                or prior["state"] in {"succeeded", "failed", "cancelled"}
+                or prior["cancel_attempts"]
+                >= (policy.cancel_max_attempts if safe else 1)
+                or (prior["cancel_attempts"] and not can_retry)
+                or (
+                    first
+                    and now
+                    >= first + timedelta(seconds=self.settings.reconciliation_seconds)
+                )
+            ):
+                return {}
+            return {
+                "cancel_requested_at": prior["cancel_requested_at"] or now,
+                "cancel_sent_at": first or now,
+                "cancel_attempts": prior["cancel_attempts"] + 1,
+                "cancel_attempt_id": attempt_id,
+                "cancel_attempted_at": now,
+                "cancel_last_error": None,
+            }
+
+        record = await self._monitor_write(operation, changes)
+        return record["cancel_attempt_id"] == attempt_id
+
+    async def confirm_cancel_attempt(self, operation, attempt_id, *, error=None):
+        error = validated_info(error)
+
+        def changes(prior):
+            if prior["cancel_attempt_id"] != attempt_id:
+                raise ExternalFailure("BACKGROUND_STATE_CONFLICT")
+            if prior["cancel_acknowledged_at"]:
+                return {}
+            return {
+                "cancel_last_error": error,
+                **(
+                    {"cancel_acknowledged_at": prior["db_now"]} if error is None else {}
+                ),
+            }
+
+        return await self._monitor_write(operation, changes)
 
     async def workspace_background(self, task_id, root=None):
         async with self.pool.connection() as conn:

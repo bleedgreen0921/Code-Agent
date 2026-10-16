@@ -35,6 +35,13 @@ class Selection(BaseModel):
     alias: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
     access: Literal["read", "write"]
     execution: Literal["sync", "background"] = "sync"
+    cancel_retry_safe: bool = False
+
+    @model_validator(mode="after")
+    def cancel_authority(self):
+        if self.cancel_retry_safe and self.execution != "background":
+            raise ValueError("cancel_retry_safe requires a background MCP tool")
+        return self
 
 
 class Server(BaseModel):
@@ -141,7 +148,8 @@ class CatalogTool:
             "version": VERSION,
             "server_id": self.server.id,
             "account_id": self.server.account_id,
-            "tool": self.selection.model_dump(),
+            "tool": self.selection.model_dump(exclude={"cancel_retry_safe"})
+            | ({"cancel_retry_safe": True} if self.selection.cancel_retry_safe else {}),
             "catalog_hash": digest(self.definition),
             "connection_hash": digest(
                 {

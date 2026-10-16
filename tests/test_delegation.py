@@ -545,7 +545,7 @@ def test_child_wait_propagates_run_controls_and_cleans_shared_container(
             Settings(),
             heartbeat_seconds=0.03,
             lease_seconds=4,
-            run_timeout=3 if control == "timeout" else 30,
+            run_timeout=15 if control == "timeout" else 30,
         ),
     )
 

@@ -782,8 +782,8 @@ def test_mcp_cleanup_is_before_completed_publication(database, tmp_path, monkeyp
         original = MCPScope.close
         closed = []
 
-        async def close(scope):
-            result = await original(scope)
+        async def close(scope, deadline=None):
+            result = await original(scope, deadline)
             closed.append(result)
             return result
 

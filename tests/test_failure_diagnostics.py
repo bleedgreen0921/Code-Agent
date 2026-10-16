@@ -888,7 +888,7 @@ def test_historic_unknown_can_clean_original_resource_without_backfilling_diagno
             assert (await r.store.task(t["id"]))["status"] == "failed"
             async with r.pool.connection() as conn:
                 await conn.execute(
-                    "UPDATE agent.background_operations SET next_poll_at=clock_timestamp() WHERE id=%s",
+                    "UPDATE agent.background_operations SET next_poll_at=clock_timestamp(),remote_poll_not_before=clock_timestamp() WHERE id=%s",
                     (op["id"],),
                 )
             for claimed in await r.store.claim_operations():

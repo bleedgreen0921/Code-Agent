@@ -215,7 +215,11 @@ class ExecutionScope:
                 cfg.image,
                 "-I",
                 "/opt/agent/entrypoint.py",
-                str(self.row["deadline_at"].timestamp()),
+                str(
+                    self.row.get(
+                        "effective_deadline_at", self.row["deadline_at"]
+                    ).timestamp()
+                ),
             ]
             _, out, _ = await self.client.call(*command, timeout=cfg.cleanup_timeout)
             identity = out.decode().strip()
@@ -244,12 +248,9 @@ class ExecutionScope:
             raise EnvironmentUnavailable(str(exc)) from exc
 
     def remaining(self):
-        from datetime import datetime, timezone
+        from agent_service.reliability import remaining_execution
 
-        return max(
-            0.001,
-            (self.row["deadline_at"] - datetime.now(timezone.utc)).total_seconds(),
-        )
+        return remaining_execution(self.row)
 
     async def healthy(self):
         self.check_open()
@@ -334,11 +335,16 @@ class ExecutionScope:
         if self.client.processes:
             raise CleanupFailed("Docker client operations remain pending")
 
-    async def close(self):
+    async def close(self, deadline=None):
+        loop = asyncio.get_running_loop()
+        deadline = min(
+            deadline if deadline is not None else float("inf"),
+            loop.time() + self.settings.cleanup_timeout,
+        )
         with self.sync_lock:
             self.closing = True
         try:
-            async with asyncio.timeout(self.settings.cleanup_timeout):
+            async with asyncio.timeout_at(deadline):
                 self.resource = await self.store.execution_resource(self.row["id"])
                 if self.resource is None or self.resource["state"] == "released":
                     await self.converge_local()
@@ -359,7 +365,7 @@ class ExecutionScope:
                 return True
         except Exception as exc:
             try:
-                async with asyncio.timeout(self.settings.cleanup_timeout):
+                async with asyncio.timeout_at(deadline):
                     await self.converge_local()
                     current = await self.store.execution_resource(self.row["id"])
                     if current and current["state"] == "released":

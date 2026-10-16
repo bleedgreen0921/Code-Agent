@@ -197,7 +197,7 @@ python -m db.trace_run RUN_UUID --namespace 'tools:FRAMEWORK_GENERATED_ID'
 curl 'http://127.0.0.1:8002/v1/runs/RUN_UUID/trace?namespace='
 ```
 
-只读委派在阶段四未增加依赖、表或迁移，当时数据库版本为 `core_0003`；当前部署统一升级到 `core_0006`。API 与 Worker 必须同步更新和重启；已有工作区 Profile 的排队绑定变化仍按 `CONFIGURATION_CHANGED` 处理，默认 chat 保持既有绑定。详见 [阶段四验收](docs/阶段四实施验收.md)。
+只读委派在阶段四未增加依赖、表或迁移，当时数据库版本为 `core_0003`；当前部署统一升级到 `core_0007`。API 与 Worker 必须同步更新和重启；已有工作区 Profile 的排队绑定变化仍按 `CONFIGURATION_CHANGED` 处理，第二批期限策略进入 chat 绑定，历史绑定仍保留。详见 [阶段四验收](docs/阶段四实施验收.md)。
 
 
 ## 项目知识与 MCP（阶段五）
@@ -206,20 +206,22 @@ curl 'http://127.0.0.1:8002/v1/runs/RUN_UUID/trace?namespace='
 
 静态 `[mcp]` 声明 HTTP 服务、本地 tools/list 目录、凭据环境变量引用和 read/write 分类，Profile.tools 显式选择稳定别名；三个内置 Profile 不自动获得 MCP。同步 MCP 工具由 Worker 使用原生 MCPAdapter，每 Run 独立连接和契约核验；写调用独占批次、先记录派发，未知结果终止 Run，不重发请求。知识或 MCP 单独使用均无需 Docker，已有工作区容器继续无网络。
 
-阶段五通过 `core_0004` 增加外部写入审计并初始化原生 Store；当前部署须迁移到 `core_0006` 并重新 bootstrap，API/Worker 不执行 DDL。配置、完整 API、目录导出、凭据配置和外部结果核对见 [项目知识与外部工具](docs/项目知识与外部工具.md)，验收证据见 [阶段五验收](docs/阶段五实施验收.md)。
+阶段五通过 `core_0004` 增加外部写入审计并初始化原生 Store；当前部署须迁移到 `core_0007` 并重新 bootstrap，API/Worker 不执行 DDL。配置、完整 API、目录导出、凭据配置和外部结果核对见 [项目知识与外部工具](docs/项目知识与外部工具.md)，验收证据见 [阶段五验收](docs/阶段五实施验收.md)。
 
 
 ## 持久任务与后台操作
 
 `POST /v1/tasks` 创建独立 Task，固定目标、Profile、工作区与前置依赖。后台命令和原生 MCP Tasks 立即启动；Run 发布阶段报告后释放执行槽。Worker 重启核对已有资源，后台结果若未被成功 Run 消费，在操作结束并确认清理后创建唯一续 Run。当前 Task 在本地后台执行期间可读取和只读委派，文件可能变化；写入和普通 Shell 被禁止。未知结果失败且不自动重试，外部副作用无法撤回。
 
-阶段六引入 core_0005；当前部署升级 core_0006、重新 bootstrap 并构建新执行镜像。显式选择配置示例的 task-workspace Profile；内置 Profile 不增加后台工具。API、默认限额、状态和故障核对见 [持久任务与后台操作](docs/持久任务与后台操作.md)。
+阶段六引入 core_0005；当前部署升级 core_0007、重新 bootstrap 并构建新执行镜像。显式选择配置示例的 task-workspace Profile；内置 Profile 不增加后台工具。API、默认限额、状态和故障核对见 [持久任务与后台操作](docs/持久任务与后台操作.md)。
 
 
 ## 第一批：异常契约与诊断
 
-当前数据库版本为 `core_0006`，只新增 Run、后台操作、同步外部操作的可空 `failure_info`。详情增加只读 `unresolved`，doctor 同时提供全局摘要。历史 `failure_info: null` 表示该记录未提供详情，不回填或推断历史副作用。
+第一批数据库版本为 `core_0006`，只新增 Run、后台操作、同步外部操作的可空 `failure_info`。详情增加只读 `unresolved`，doctor 同时提供全局摘要。历史 `failure_info: null` 表示该记录未提供详情，不回填或推断历史副作用。
 
 非法后台回执不能成功；普通更新保护操作终态、结果和原资源身份。操作未知与 Task 失败在同一事务内保存，内部迟到事实补记不会恢复 Task、消费结果或改写已发布 checkpoint。清理字段与执行结果独立。API 和 Worker 的受支持入口安装同一安全 JSON 日志格式器，保留关联字段及堆栈位置，省略异常消息、源码和参数。
 
 部署顺序为停止旧 API/Worker → owner 执行 `python -m db.migrate` → `python -m db.bootstrap` → `python -m db.doctor --json` → 启动新进程。运行角色无需增加权限。第一批不增加重试、自动重放、恢复接口或工作区回滚。完整字段、状态规则及边界见 [异常契约与诊断](docs/第一批异常契约与诊断.md)，验证证据见 [独立验收记录](docs/第一批异常契约与诊断验收.md)。
+
+第二批当前数据库版本为 `core_0007`，增加跨 Worker 的观察预算、远程间隔和取消尝试/确认，执行提前为清理与发布预留时间；维护中断不延长租约授权。详见[第二批行为说明](docs/第二批后台核对与清理可靠性.md)与[验收记录](docs/第二批后台核对与清理可靠性验收.md)。

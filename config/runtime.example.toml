@@ -103,3 +103,20 @@ tools = ["glob_search", "grep_search", "read_file", "edit_file", "shell", "deleg
 # { name = "long_job", alias = "start_job", access = "write", execution = "background" }
 # A remote Task profile selects start_job plus background_status/background_result/
 # cancel_background explicitly. The same alias cannot select both execution modes.
+
+# Trusted recovery policy. All intervals are seconds; times must be finite and positive.
+[reliability]
+observation_max_failures = 5
+observation_window = 30.0
+observation_backoff_base = 1.0
+observation_backoff_cap = 8.0
+cleanup_backoff_base = 8.0
+cleanup_backoff_cap = 60.0
+publication_reserve = 2.0
+cancel_max_attempts = 3
+maintenance_max_failures = 5
+maintenance_window = 30.0
+maintenance_backoff_base = 1.0
+maintenance_backoff_cap = 8.0
+# Each [[mcp.servers.tools]] background selection may set cancel_retry_safe = true.
+# The default is false. This authorization must come from the server operator.

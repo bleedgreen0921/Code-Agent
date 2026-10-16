@@ -1,9 +1,9 @@
 """Native async tool middleware with a guarded execution boundary."""
 
+import asyncio
 import logging
 import time
 from copy import deepcopy
-from datetime import datetime, timezone
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from types import MappingProxyType
@@ -120,7 +120,10 @@ class ToolLifecycleMiddleware(AgentMiddleware):
         call = Call(request.runtime, request.runtime.context, "", "model")
         token = active_model_call.set(call)
         try:
-            result = await handler(request)
+            from agent_service.reliability import remaining_execution
+
+            async with asyncio.timeout(remaining_execution(call.context)):
+                result = await handler(request)
             if call.violation is not None:
                 raise call.violation
             if call.failure is not None:
@@ -155,7 +158,10 @@ class ToolLifecycleMiddleware(AgentMiddleware):
         outcome = "exception"
         error_code = None
         try:
-            result = await handler(request)
+            from agent_service.reliability import remaining_execution
+
+            async with asyncio.timeout(remaining_execution(call.context)):
+                result = await handler(request)
             # Hooks cannot suppress control failures or repeat execution.
             if call.violation is not None:
                 raise call.violation
@@ -244,10 +250,13 @@ class PermissionMiddleware(AgentMiddleware):
         ):
             call.violation = HookContractError("Hook replaced trusted tool identity")
             raise call.violation
-        deadline = getattr(call.context, "deadline_at", None)
-        if deadline is not None and datetime.now(timezone.utc) >= deadline:
-            call.failure = TimeoutError("Tool execution deadline expired")
-            raise call.failure
+        from agent_service.reliability import remaining_execution
+
+        try:
+            remaining_execution(call.context)
+        except TimeoutError as exc:
+            call.failure = exc
+            raise
         call.name = request.tool_call["name"]
         policy = self.policy
         denied = (

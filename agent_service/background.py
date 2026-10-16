@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import ToolMessage
@@ -14,6 +14,16 @@ from langchain_core.tools import StructuredTool, ToolException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agent_service.failure import failure_info, is_control
+from agent_service.reliability import (
+    observe,
+    ObservationFailure,
+    poll_interval,
+    remaining_execution,
+    transient_client_error,
+    observation_call_limit,
+    backoff,
+    background_policy,
+)
 from agent_service.background_store import public_operation
 from agent_service.execution import DockerClient, LABEL, FIXED_ENV, check_environment
 from agent_service.external_operations import ExternalFailure
@@ -89,6 +99,8 @@ def reject_background(code, message=None):
 
 def authorized(row, *, start=None):
     call = active_call.get()
+    if call:
+        remaining_execution(call.context)
     if (
         not row
         or not row.get("task_id")
@@ -155,6 +167,7 @@ def background_tools(db=None, row=None, registry=None):
             != "background-v1"
         ):
             raise ExternalFailure("BACKGROUND_IMAGE_UNSUPPORTED")
+        remaining_execution(call.context)
         op = await db.reserve_operation(
             row,
             call.call_id,
@@ -337,6 +350,17 @@ async def start_docker(db, registry, op, command, cwd):
     )
 
 
+async def docker_action_guard(db, client, op, identity):
+    await db.monitor_record(op)
+    daemon = await observe(client.daemon())
+    if op["daemon_id"] and daemon != op["daemon_id"]:
+        raise ExternalFailure("BACKGROUND_DAEMON_CHANGED")
+    inspected = await observe(client.inspect(identity))
+    if inspected is None:
+        raise ExternalFailure("BACKGROUND_CLEANUP_UNCONFIRMED")
+    docker_identity(inspected, op)
+
+
 async def monitor_docker(db, registry, op):
     cfg = registry.execution
     if (
@@ -346,10 +370,12 @@ async def monitor_docker(db, registry, op):
     ):
         raise ExternalFailure("BACKGROUND_CONFIGURATION_CHANGED")
     client = DockerClient()
-    daemon = await client.daemon()
+    daemon = await observe(client.daemon())
     if op["daemon_id"] and daemon != op["daemon_id"]:
         raise ExternalFailure("BACKGROUND_DAEMON_CHANGED")
-    inspected = await client.inspect(op["container_id"] or op["container_name"])
+    inspected = await observe(
+        client.inspect(op["container_id"] or op["container_name"])
+    )
     if inspected is None:
         if op["phase"] == "reserved":
             save = (
@@ -379,16 +405,17 @@ async def monitor_docker(db, registry, op):
         op["cancel_requested_at"] is not None or expired or op["state"] == "unknown"
     )
     stopped_for_timeout = inspected["State"]["Running"] and expired
-    if inspected["State"]["Running"] and not cancel:
+    if inspected["State"]["Running"] and not cancel and op["state"] not in OP_TERMINAL:
         await db.operation_update(op, state="running", phase="started")
         return
     confirmed_stop = False
     if inspected["State"]["Running"]:
-        # Stop the entire container, including detached process groups.
+        # Recheck the original identity and live monitor grant before every mutation.
+        await docker_action_guard(db, client, op, inspected["Id"])
         await client.call(
             "stop", "--time", "1", inspected["Id"], timeout=cfg.cleanup_timeout
         )
-        inspected = await client.inspect(inspected["Id"])
+        inspected = await observe(client.inspect(inspected["Id"]))
         if not inspected or inspected["State"]["Running"]:
             raise ExternalFailure("BACKGROUND_STOP_UNCONFIRMED")
         docker_identity(inspected, op)
@@ -401,7 +428,9 @@ async def monitor_docker(db, registry, op):
                 "BACKGROUND_NOT_STARTED",
             )
         else:
-            _, raw, _ = await client.call("logs", inspected["Id"], maximum=65536)
+            _, raw, _ = await observe(
+                client.call("logs", inspected["Id"], maximum=65536)
+            )
             try:
                 result = BackgroundReceipt.model_validate_json(raw).model_dump()
                 # Leave room for delivery metadata, so background_result can return
@@ -455,8 +484,9 @@ async def monitor_docker(db, registry, op):
                 failure_info=failure_info(code) if code else None,
             )
     # Result commit is confirmed before resource removal; remove acknowledgements can be reconciled.
+    await docker_action_guard(db, client, op, inspected["Id"])
     await client.call("rm", "--force", inspected["Id"], timeout=cfg.cleanup_timeout)
-    if await client.inspect(inspected["Id"]) is not None:
+    if await observe(client.inspect(inspected["Id"])) is not None:
         raise ExternalFailure("BACKGROUND_CLEANUP_UNCONFIRMED")
     await db.operation_cleanup(op, cleanup_state="released", cleanup_error=None)
 
@@ -485,6 +515,7 @@ def mcp_background_tool(db, row, registry, alias, entry):
         client = await task_client(registry, entry)
         async with task_connection(client):
             await verify_task_client(client, entry)
+            remaining_execution(call.context)
             op = await db.reserve_operation(
                 row,
                 call.call_id,
@@ -556,6 +587,7 @@ def mcp_background_tool(db, row, registry, alias, entry):
                         state="running",
                         phase="submitted",
                     )
+
             finally:
                 await db.release_monitor(op, 0)
         return json.dumps(public_operation(op, result=False), default=str)
@@ -623,6 +655,29 @@ def bounded_remote_result(client, value):
     return {"content": text, "truncated": truncated}
 
 
+@asynccontextmanager
+async def observation_connection(client):
+    await observe(client.__aenter__(), client=client)
+    try:
+        yield client
+    except BaseException as primary:
+        try:
+            await observe(
+                client.__aexit__(type(primary), primary, primary.__traceback__),
+                client=client,
+            )
+        except BaseException as shutdown:
+            # A disconnect fault cannot replace a protocol, identity or control fault
+            # with a recoverable observation. Mixed relevant causes fail closed.
+            if isinstance(primary, ObservationFailure) and not isinstance(
+                shutdown, ObservationFailure
+            ):
+                raise shutdown from None
+        raise
+    else:
+        await observe(client.__aexit__(None, None, None), client=client)
+
+
 async def monitor_mcp(db, registry, op):
     from fastmcp_tasks import ToolTask
     from fastmcp_tasks.client_models import ClientCreateTaskResult
@@ -634,10 +689,18 @@ async def monitor_mcp(db, registry, op):
         or entry.manifest() != op["binding"].get("manifest")
     ):
         raise ExternalFailure("BACKGROUND_CONFIGURATION_CHANGED")
+    if not op["remote_handle"] or not op["receipt"]:
+        if op["state"] not in OP_TERMINAL:
+            await db.operation_update(
+                op, state="unknown", error_code="MCP_RESULT_UNKNOWN"
+            )
+        return registry.reliability.cleanup_backoff_base
     client = await task_client(registry, entry)
-    async with client:
-        await verify_task_client(client, entry)
-        if remote_identity(client, entry) != op["binding"]:
+    async with observation_connection(client):
+        await observe(verify_task_client(client, entry), client=client)
+        if remote_identity(client, entry) != {
+            k: v for k, v in op["binding"].items() if k != "reliability"
+        }:
             raise ExternalFailure("MCP_TASK_IDENTITY_CHANGED")
         if not op["remote_handle"] or not op["receipt"]:
             await db.operation_update(
@@ -652,15 +715,15 @@ async def monitor_mcp(db, registry, op):
         if handle.task_id != op["remote_handle"]:
             raise ExternalFailure("MCP_TASK_IDENTITY_CHANGED")
         try:
-            current = await handle.status()
+            current = await observe(handle.status(), client=client)
         except ValidationError:
             raise ExternalFailure("MCP_TASK_PROTOCOL_ERROR") from None
         if current.task_id != op["remote_handle"]:
             raise ExternalFailure("MCP_TASK_IDENTITY_CHANGED")
         status = current.status
-        delay = max(
-            db.settings.background_poll_seconds, (current.poll_interval_ms or 0) / 1000
-        )
+        interval = poll_interval(current.poll_interval_ms)
+        await db.remote_poll(op, interval)
+        delay = max(db.settings.background_poll_seconds, (interval or 0) / 1000)
         expired = datetime.now(timezone.utc) >= op["deadline_at"]
         if status in ("completed", "failed", "cancelled"):
             if status == "completed":
@@ -725,51 +788,171 @@ async def monitor_mcp(db, registry, op):
         )
         if cancel:
             now = datetime.now(timezone.utc)
-            if not op["cancel_sent_at"]:
-                # Persist intent before the single cooperative cancellation request.
-                changes = {
-                    "cancel_requested_at": op["cancel_requested_at"] or now,
-                    "cancel_sent_at": now,
-                }
-                if op["state"] != "unknown":
-                    changes.update(
-                        state="cancelling",
-                        error_code="MCP_INTERACTION_UNSUPPORTED"
-                        if status == "input_required"
-                        else "BACKGROUND_TIMEOUT"
-                        if expired
-                        else op["error_code"],
-                    )
-                # Historic unknown facts may have no diagnosis. Cancellation intent
-                # must neither backfill nor replace their protected execution fields.
-                await db.operation_update(op, **changes)
-                await handle.cancel()
-            elif (
-                now - op["cancel_sent_at"]
-            ).total_seconds() >= db.settings.reconciliation_seconds:
-                await db.operation_update(
-                    op, state="unknown", error_code="MCP_CANCEL_UNCONFIRMED"
+            # Persist intent independently of attempt reservation and acknowledgement.
+            changes = {"cancel_requested_at": op["cancel_requested_at"] or now}
+            if op["state"] not in OP_TERMINAL:
+                changes.update(
+                    state="cancelling",
+                    error_code="MCP_INTERACTION_UNSUPPORTED"
+                    if status == "input_required"
+                    else "BACKGROUND_TIMEOUT"
+                    if expired
+                    else op["error_code"],
                 )
+            await db.operation_update(op, **changes)
+            if (
+                op["cancel_sent_at"]
+                and (now - op["cancel_sent_at"]).total_seconds()
+                >= db.settings.reconciliation_seconds
+            ):
+                if op["state"] not in OP_TERMINAL:
+                    await db.operation_update(
+                        op, state="unknown", error_code="MCP_CANCEL_UNCONFIRMED"
+                    )
+            else:
+                attempt_id = uuid4()
+                if await db.reserve_cancel_attempt(op, attempt_id):
+                    try:
+                        async with asyncio.timeout(observation_call_limit.get()):
+                            await handle.cancel()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        transient = transient_client_error(exc, client)
+                        if not transient:
+                            log.exception(
+                                "background_observation_stopped",
+                                extra={
+                                    "operation_id": op["id"],
+                                    "recovery_phase": "cancel",
+                                },
+                            )
+                        await db.confirm_cancel_attempt(
+                            op,
+                            attempt_id,
+                            error=failure_info(
+                                "MCP_CANCEL_TRANSPORT_FAILED"
+                                if transient
+                                else "MCP_TASK_PROTOCOL_ERROR"
+                            ),
+                        )
+                        if transient:
+                            policy = registry.reliability
+                            return max(
+                                delay,
+                                backoff(
+                                    op["cancel_attempts"],
+                                    policy.observation_backoff_base,
+                                    policy.observation_backoff_cap,
+                                ),
+                            )
+                        raise ExternalFailure("MCP_TASK_PROTOCOL_ERROR") from None
+                    else:
+                        await db.confirm_cancel_attempt(op, attempt_id)
+                        log.info(
+                            "background_cancel_confirmed",
+                            extra={
+                                "operation_id": op["id"],
+                                "task_id": op["task_id"],
+                                "run_id": op["run_id"],
+                                "recovery_attempts": op["cancel_attempts"],
+                                "cancel_acknowledged": True,
+                            },
+                        )
         return delay
 
 
 async def monitor_operation(db, registry, op):
     delay = db.settings.background_poll_seconds
+    begun = False
+    limit_token = None
     try:
         op.update(await db.monitor_record(op))
-        # Leave time in the lease for persistence and disconnect cleanup.
-        async with asyncio.timeout(max(0.1, db.settings.reconciliation_seconds - 2)):
+        frozen = op["binding"].get("reliability")
+        if frozen is not None and frozen != background_policy(registry, db.settings):
+            raise ExternalFailure("BACKGROUND_CONFIGURATION_CHANGED")
+        if op["backend"] == "mcp" and (not op["remote_handle"] or not op["receipt"]):
+            if op["state"] not in OP_TERMINAL:
+                await db.operation_update(
+                    op, state="unknown", error_code="MCP_RESULT_UNKNOWN"
+                )
+            await db.release_monitor(op, registry.reliability.cleanup_backoff_cap)
+            return
+        begun = await db.begin_observation(op)
+        if not begun:
+            return
+        now = datetime.now(timezone.utc)
+        remaining = (op["monitor_until"] - now).total_seconds() - 2
+        if op["observation_first_failed_at"] and op["state"] not in OP_TERMINAL:
+            remaining = min(
+                remaining,
+                registry.reliability.observation_window
+                - (now - op["observation_first_failed_at"]).total_seconds(),
+            )
+        limit_token = observation_call_limit.set(
+            max(
+                0,
+                min(
+                    10 if op["backend"] == "docker" else registry.mcp.call_timeout,
+                    remaining - 1,
+                ),
+            )
+        )
+        # This is the controller's total bound, distinct from a remote call timeout.
+        async with asyncio.timeout(max(0, remaining)):
             if op["backend"] == "docker":
                 await monitor_docker(db, registry, op)
             else:
                 delay = await monitor_mcp(db, registry, op) or delay
+        await db.finish_observation(op, delay=delay)
     except asyncio.CancelledError:
         raise
+    except ObservationFailure:
+        # Persistence retries are owned by the database method, never by this observer.
+        await db.finish_observation(
+            op, error=failure_info("BACKGROUND_OBSERVATION_TRANSIENT")
+        )
+        log.info(
+            "background_observation_retry",
+            extra={
+                "operation_id": op["id"],
+                "task_id": op["task_id"],
+                "run_id": op["run_id"],
+                "recovery_attempts": op["observation_failures"],
+                "next_observation_at": str(op["next_poll_at"]),
+                "recovery_phase": "cleanup"
+                if op["state"] in OP_TERMINAL
+                else "observation",
+            },
+        )
     except Exception as exc:
+        import psycopg
+        from psycopg_pool import PoolTimeout
+
+        # Database failures are not remote failures. Keep an unfinished round durable;
+        # ownership replacement will count it once, without repeating external I/O here.
+        if isinstance(exc, (psycopg.Error, PoolTimeout)):
+            log.exception(
+                "background_diagnostic_unconfirmed", extra={"operation_id": op["id"]}
+            )
+            return
+        if (
+            isinstance(exc, TimeoutError)
+            and begun
+            and op["observation_first_failed_at"]
+        ):
+            await db.finish_observation(
+                op, error=failure_info("BACKGROUND_OBSERVATION_TRANSIENT")
+            )
+            return
         code = (
             exc.code
             if isinstance(exc, ExternalFailure)
             else "BACKGROUND_RECONCILIATION_FAILED"
+        )
+        log.exception(
+            "background_observation_stopped",
+            extra={"operation_id": op["id"], "error_code": code},
         )
         try:
             if op["state"] in OP_TERMINAL:
@@ -785,6 +968,11 @@ async def monitor_operation(db, registry, op):
                     cleanup_state="failed",
                     cleanup_error="RESOURCE_CLEANUP_FAILED",
                 )
+            if not begun:
+                await db.release_monitor(op, registry.reliability.cleanup_backoff_base)
+            if begun:
+                # Complete the round with a stable non-recoverable diagnostic.
+                await db.finish_observation(op, error=failure_info(code))
         except Exception:
             log.exception(
                 "background_diagnostic_unconfirmed",
@@ -796,8 +984,10 @@ async def monitor_operation(db, registry, op):
                 },
             )
     finally:
+        if limit_token is not None:
+            observation_call_limit.reset(limit_token)
         try:
-            await db.release_monitor(op, delay)
+            await db.release_monitor(op)
         except Exception:
             log.exception(
                 "background_monitor_release_unconfirmed",

@@ -18,6 +18,7 @@ from agent_service.execution_config import (
     WORKSPACE_TOOLS,
     IMPLEMENTATION_VERSION,
 )
+from agent_service.reliability import ReliabilitySettings
 from agent_service.mcp_config import MCPSettings, load_catalogs, MAX_CATALOG_BYTES
 from agent_service.workspace_tools import builtin_tools
 from agent_service.knowledge import (
@@ -88,6 +89,7 @@ class RuntimeFile(Declaration):
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
     knowledge: KnowledgeSettings = Field(default_factory=KnowledgeSettings)
     mcp: MCPSettings = Field(default_factory=MCPSettings)
+    reliability: ReliabilitySettings = Field(default_factory=ReliabilitySettings)
 
 
 @dataclass(frozen=True)
@@ -125,6 +127,7 @@ class Registry:
             config.execution.output_bytes,
             config.execution.output_lines,
         )
+        self.reliability = config.reliability
         self.mcp = config.mcp
         self.mcp_tools = load_catalogs(config.mcp)
         from agent_service.background import background_tools
@@ -346,6 +349,7 @@ class Registry:
                         if set(declaration.tools) & self.mcp_tools.keys()
                         else {}
                     ),
+                    "reliability": self.reliability.model_dump(),
                     "tools": sorted(declaration.tools),
                     "extension_version": self.extensions.get(
                         profile, Extension()

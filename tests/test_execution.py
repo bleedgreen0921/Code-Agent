@@ -1017,7 +1017,9 @@ def test_total_deadline_keeps_run_timeout_semantics(database, tmp_path):
 
     database(
         check,
-        replace(Settings(), run_timeout=2.0, heartbeat_seconds=0.05, lease_seconds=3.0),
+        replace(
+            Settings(), run_timeout=14.0, heartbeat_seconds=0.05, lease_seconds=3.0
+        ),
     )
 
 

@@ -40,6 +40,8 @@ class RunContext:
     workspace_identity: str | None = None
     binding_fingerprint: str | None = None
     deadline_at: datetime | None = None
+    effective_deadline_at: datetime | None = None
+    execution_authority: object = None
     agent_id: str | None = None
     parent_agent_id: str | None = None
     agent_depth: int = 0

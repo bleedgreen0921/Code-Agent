@@ -229,7 +229,7 @@ def test_queue_execution_timeout_cancel_race_and_worker_restart(database):
         assert not restarted.tasks and calls == 1
         assert await store.renew(row["id"], claim["lease_token"]) is None
 
-    cfg = replace(Settings(), run_timeout=0.1, heartbeat_seconds=0.02, lease_seconds=1)
+    cfg = replace(Settings(), run_timeout=2.1, heartbeat_seconds=0.02, lease_seconds=1)
     database(check, cfg)
 
 

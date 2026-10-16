@@ -35,7 +35,7 @@ agent = build_agent(
 
 `submitted_binding` 在提交时写入；`runtime_config` 在有效租约下幂等写入并确认后，Worker 才调用 Agent。运行摘要只记录模型名称、去除用户信息/路径/查询的端点、白名单参数、profile/提示词/工具 Schema 指纹、中间件配置与扩展版本、框架版本。引入运行摘要前的历史运行保持 runtime_config 为 null。普通答案使用最终 AI 文本；非 Task Run 的结构化答案使用原生 structured_response 的 JSON 文本，不追加模型调用；Task Run 使用最终 AI 文本。会话与同一 Task 的续 Run 只继承成功 Run 的消息，图内业务状态、计数和 Run 资源重新开始。
 
-核心数据库由 `python -m db.migrate` 使用 Alembic 标准程序化升级，单链 `core_0001 → core_0002 → core_0003 → core_0004 → core_0005 → core_0006`。`core_0002` 增加运行绑定和配置摘要；`core_0003` 增加 execution_resources；`core_0004` 增加同步外部写入审计 external_operations；`core_0005` 增加 Task、依赖、后台操作和事件，并在 Run 中增加 task_id / execution_no。`core_0006` 仅增加三处可空 JSONB failure_info，值必须为对象且不超过 2 KiB；历史记录保持 NULL。阶段三的上下文能力与阶段四的只读委派自身未新增迁移。core_0001.sql 是唯一基线定义，structure.json 是只读校验签名；测试验证已知旧版本升级和空库初始化得到相同结构。迁移全程使用同一 advisory lock，先校验再 stamp/upgrade；revision 表由 agent.alembic_version 承担版本权威，旧 schema_version 仅保留只读来源标识。原生 checkpoint 与 Store 表由迁移入口调用框架 setup() 管理，不由应用迁移重建。运行角色只有 revision 的 SELECT，readiness/doctor 检查版本和权限；启动服务不执行 DDL。
+核心数据库由 `python -m db.migrate` 使用 Alembic 标准程序化升级，单链 `core_0001 → core_0002 → core_0003 → core_0004 → core_0005 → core_0006 → core_0007`。`core_0002` 增加运行绑定和配置摘要；`core_0003` 增加 execution_resources；`core_0004` 增加同步外部写入审计 external_operations；`core_0005` 增加 Task、依赖、后台操作和事件，并在 Run 中增加 task_id / execution_no。`core_0006` 仅增加三处可空 JSONB failure_info，值必须为对象且不超过 2 KiB；历史记录保持 NULL。阶段三的上下文能力与阶段四的只读委派自身未新增迁移。core_0001.sql 是唯一基线定义，structure.json 是只读校验签名；测试验证已知旧版本升级和空库初始化得到相同结构。迁移全程使用同一 advisory lock，先校验再 stamp/upgrade；revision 表由 agent.alembic_version 承担版本权威，旧 schema_version 仅保留只读来源标识。原生 checkpoint 与 Store 表由迁移入口调用框架 setup() 管理，不由应用迁移重建。运行角色只有 revision 的 SELECT，readiness/doctor 检查版本和权限；启动服务不执行 DDL。
 
 
 ## 上下文、Todo 与技能
@@ -78,3 +78,5 @@ Run 发布阶段报告后释放执行槽，后台操作按独立租约监控；�
 `scripts.serve` 与 `agent_service.worker` 安装共享 JSON 格式器。日志只接受关联字段及既有用量/委派统计白名单；字符串不超过 256 UTF-8 字节，单条 JSON 不超过 16 KiB。堆栈仅含异常类型、文件、函数和行号；不格式化异常消息、原因链、源码或局部变量。超限先裁剪统计再裁剪堆栈并标记 truncated，格式化失败返回固定安全事件。
 
 Run/会话轮次详情与 Task 详情在同一 REPEATABLE READ READ ONLY 快照中读取主体、关系与未决摘要；不取 admission 锁，不触发维护或外部观察。列表不逐条聚合。完整状态守卫、摘要定义与部署约束见 [第一批契约](第一批异常契约与诊断.md)。
+
+第二批 core_0007 增加持久观察预算、远程轮询下限和独立取消尝试/确认；统一有效执行期限、清理/发布预留及维护故障隔离见[后台核对与清理可靠性](第二批后台核对与清理可靠性.md)。

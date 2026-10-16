@@ -80,7 +80,8 @@ def test_skills_snapshot_bindings_and_legacy_chat_fingerprint(tmp_path):
     assert "write_todos" in empty.profiles["workspace_read"].tools
     assert "read_skill" not in empty.profiles["workspace_read"].tools
     assert empty.profiles["chat"].tools == ()
-    # Exact stage-two formula: empty new declarations must not invalidate chat.
+    # The new execution deadline policy is part of every profile, including chat.
+    # Unrelated skills still must not change this fingerprint.
     old_profile = fingerprint(
         {
             "id": "chat",
@@ -89,6 +90,7 @@ def test_skills_snapshot_bindings_and_legacy_chat_fingerprint(tmp_path):
             "requires_workspace": False,
             "extension_version": "1",
             "tool_schemas": {},
+            "reliability": empty.reliability.model_dump(),
         }
     )
     assert empty.bind()["profile_fingerprint"] == old_profile
@@ -885,7 +887,7 @@ def test_native_summary_retry_timeout_cancel_preserves_cleanup_without_replay(
             summary_trigger_tokens=150,
             summary_keep_tokens=40,
             summary_trim_tokens=1000,
-            run_timeout=2.5 if behavior == "timeout" else 30,
+            run_timeout=14.5 if behavior == "timeout" else 30,
             heartbeat_seconds=0.03,
             lease_seconds=4,
         ),

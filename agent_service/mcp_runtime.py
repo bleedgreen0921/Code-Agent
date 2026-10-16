@@ -4,7 +4,6 @@ import asyncio
 import json
 import os
 from contextlib import AsyncExitStack
-from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import httpx2
@@ -24,31 +23,50 @@ from agent_service.policy import active_call
 
 
 class LimitedStream(httpx2.AsyncByteStream):
-    def __init__(self, stream, is_sse):
+    def __init__(self, stream, is_sse, observation_transport=None):
         self.stream, self.is_sse = stream, is_sse
+        self.observation_transport = observation_transport
 
     async def __aiter__(self):
         size = 0
-        async for chunk in self.stream:
-            size += len(chunk)
-            # SDK 2.3 enforces max_sse_event_size=1 MiB before JSON parsing.
-            # JSON bodies also need a bound before response.aread().
-            if not self.is_sse and size > MAX_MESSAGE_BYTES:
-                raise ExternalFailure("MCP_MESSAGE_TOO_LARGE")
-            yield chunk
+        try:
+            async for chunk in self.stream:
+                size += len(chunk)
+                if not self.is_sse and size > MAX_MESSAGE_BYTES:
+                    raise ExternalFailure("MCP_MESSAGE_TOO_LARGE")
+                yield chunk
+        except Exception as exc:
+            if self.observation_transport is not None:
+                from agent_service.reliability import transient_observation
+
+                self.observation_transport["transient"] = transient_observation(exc)
+            raise
 
     async def aclose(self):
         await self.stream.aclose()
 
 
 class BoundedTransport(httpx2.AsyncBaseTransport):
-    def __init__(self, transport):
+    def __init__(self, transport, observation_transport=None):
         self.transport = transport
+        self.observation_transport = observation_transport
 
     async def handle_async_request(self, request):
         if len(await request.aread()) > MAX_MESSAGE_BYTES:
             raise ExternalFailure("MCP_MESSAGE_TOO_LARGE")
-        response = await self.transport.handle_async_request(request)
+        try:
+            response = await self.transport.handle_async_request(request)
+        except Exception as exc:
+            if self.observation_transport is not None:
+                from agent_service.reliability import transient_observation
+
+                self.observation_transport["transient"] = transient_observation(exc)
+            raise
+        if self.observation_transport is not None and response.status_code in (
+            401,
+            403,
+        ):
+            self.observation_transport["transient"] = False
         if (
             300 <= response.status_code < 400
             or response.headers.get("content-encoding", "identity").lower()
@@ -66,7 +84,9 @@ class BoundedTransport(httpx2.AsyncBaseTransport):
         ):
             await response.aclose()
             raise ExternalFailure("MCP_MESSAGE_TOO_LARGE")
-        response.stream = LimitedStream(response.stream, is_sse)
+        response.stream = LimitedStream(
+            response.stream, is_sse, self.observation_transport
+        )
         return response
 
     async def aclose(self):
@@ -149,8 +169,17 @@ def make_client(server, settings, output_limits, *, background=False):
         headers["Authorization"] = "Bearer " + os.environ[server.bearer_env]
     if any("\n" in value or "\r" in value for value in headers.values()):
         raise ExternalFailure("MCP_CREDENTIALS_INVALID")
+    observation_transport = {}
+
+    def owned_http_factory(headers=None, timeout=None, auth=None, **kwargs):
+        connection = http_client_factory(
+            headers=headers, timeout=timeout, auth=auth, **kwargs
+        )
+        connection._transport.observation_transport = observation_transport
+        return connection
+
     transport = StreamableHttpTransport(
-        server.url, headers=headers, httpx_client_factory=http_client_factory
+        server.url, headers=headers, httpx_client_factory=owned_http_factory
     )
     extensions = []
     if background:
@@ -168,6 +197,7 @@ def make_client(server, settings, output_limits, *, background=False):
         log_handler=ignore_remote_event,
         progress_handler=ignore_remote_event,
     )
+    client.observation_transport = observation_transport
     client.output_limits = output_limits
     client.redactions = tuple(
         sorted(
@@ -191,10 +221,9 @@ class MCPScope:
         self.settings = registry.mcp
 
     def remaining(self, maximum):
-        seconds = (self.row["deadline_at"] - datetime.now(timezone.utc)).total_seconds()
-        if seconds <= 0:
-            raise TimeoutError("Run deadline expired")
-        return min(maximum, seconds)
+        from agent_service.reliability import remaining_execution
+
+        return remaining_execution(self.row, maximum)
 
     async def prepare(self, profile):
         from agent_service.profiles import ConfigurationChanged
@@ -365,9 +394,12 @@ class MCPScope:
         await self.operations.outcome(call_id, "unknown", code="MCP_RESULT_UNKNOWN")
         self.pending.discard(call_id)
 
-    async def close(self):
+    async def close(self, deadline=None):
         self.closing = True
-        deadline = asyncio.get_running_loop().time() + self.settings.cleanup_timeout
+        deadline = min(
+            deadline if deadline is not None else float("inf"),
+            asyncio.get_running_loop().time() + self.settings.cleanup_timeout,
+        )
         try:
             try:
                 async with asyncio.timeout_at(deadline):
