@@ -4,3 +4,6 @@
 !execution/Dockerfile
 !execution/helper.py
 !execution/entrypoint.py
+
+!execution/git_tools.py
+!execution/background.py

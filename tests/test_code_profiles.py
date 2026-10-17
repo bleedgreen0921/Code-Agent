@@ -134,7 +134,8 @@ def test_delivered_config_skills_and_default_compatibility(tmp_path, monkeypatch
     for name in NAMES:
         profile = registry.profiles[name]
         assert set(profile.tools) == READ_TOOLS | (
-            {"edit_file", "shell"} if name == "code-fix" else set()
+            {"edit_file", "shell", "git_status", "git_diff"} if name == "code-fix" else
+            {"git_status", "git_log", "git_diff", "git_read_file"} if name == "code-review" else set()
         )
         assert profile.skills == (name,) and profile.requires_workspace
         with pytest.raises(ValueError, match="requires a workspace"):

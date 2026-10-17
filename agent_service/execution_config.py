@@ -6,9 +6,9 @@ import re
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-IMPLEMENTATION_VERSION = "workspace-v1"
+IMPLEMENTATION_VERSION = "workspace-v2"
 WORKSPACE_TOOLS = frozenset(
-    {"glob_search", "grep_search", "read_file", "edit_file", "shell"}
+    {"glob_search", "grep_search", "read_file", "edit_file", "shell", "git_status", "git_log", "git_diff", "git_read_file"}
 )
 WRITE_TOOLS = frozenset({"edit_file", "shell"})
 

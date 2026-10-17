@@ -92,6 +92,16 @@ _register(
     "Operation was rejected before dispatch.",
 )
 _register(
+    "GIT_ARGUMENTS_INVALID GIT_REFERENCE_INVALID",
+    "parameter", "not_dispatched", "correct_arguments",
+    "Git arguments or commit reference are invalid.",
+)
+_register(
+    "GIT_REPOSITORY_UNAVAILABLE GIT_UNSUPPORTED GIT_INDEX_CONFLICT GIT_FILE_NOT_FOUND GIT_READ_FAILED",
+    "execution", "not_applicable", "stop",
+    "Git source could not be fully read; review coverage is incomplete.",
+)
+_register(
     "FILE_VERSION_CONFLICT",
     "verification",
     "not_dispatched",

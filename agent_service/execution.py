@@ -273,6 +273,8 @@ class ExecutionScope:
                     "operation": name,
                     "args": args,
                     "file_bytes": self.settings.file_bytes,
+                    "output_bytes": self.settings.output_bytes,
+                    "output_lines": self.settings.output_lines,
                 }
             ).encode(),
             timeout=min(self.settings.command_timeout, self.remaining()),

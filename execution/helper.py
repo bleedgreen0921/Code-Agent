@@ -12,7 +12,7 @@ class VersionConflict(ValueError):
     pass
 
 
-VERSION = "workspace-v1"
+VERSION = "workspace-v2"
 ROOT = Path("/workspace")
 
 
@@ -217,14 +217,23 @@ def main():
         import langchain
 
         subprocess.run(["rg", "--version"], stdout=subprocess.DEVNULL, check=True)
+        subprocess.run(["git", "--version"], stdout=subprocess.DEVNULL, check=True)
         assert langchain.__version__ == "1.4.2"
         print(json.dumps({"version": VERSION}))
         return
+    # Python -I excludes the script directory. Load only this immutable image path.
+    sys.path.insert(0, "/opt/agent")
+    from git_tools import GitError, operation as git_operation
+
     try:
         maximum = request["file_bytes"]
         args = request["args"]
         if operation in ("read_file", "edit_file"):
             result = file_operation(operation, args, maximum)
+        elif operation in ("git_status", "git_log", "git_diff", "git_read_file"):
+            result = git_operation(ROOT, operation, args, maximum,
+                                   request.get("output_bytes", 16384),
+                                   request.get("output_lines", 200))
         elif operation in ("glob_search", "grep_search"):
             result = search(operation, args, maximum)
         else:
@@ -235,7 +244,14 @@ def main():
             result["content"] = raw[:24000].decode("utf-8", "ignore")
             result["truncated"] = True
         print(json.dumps(result, ensure_ascii=True))
-    except (ValueError, OSError, UnicodeError) as exc:
+    except GitError as exc:
+        print(json.dumps({"error": str(exc)[:500], "code": exc.code}))
+    except UnicodeError:
+        print(json.dumps({"error": "Non-UTF-8 content; not fully read", "code": "GIT_UNSUPPORTED" if operation.startswith("git_") else "FILE_OPERATION_FAILED"}))
+    except (ValueError, OSError) as exc:
+        if operation.startswith("git_"):
+            print(json.dumps({"error": "Git source or object could not be fully read", "code": "GIT_READ_FAILED"}))
+            return
         print(json.dumps({"error": str(exc)[:500], "code": "FILE_VERSION_CONFLICT" if isinstance(exc, VersionConflict) else "FILE_OPERATION_FAILED"}))
 
 

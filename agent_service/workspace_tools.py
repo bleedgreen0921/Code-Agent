@@ -4,7 +4,8 @@ from langchain.agents.middleware.file_search import FilesystemFileSearchMiddlewa
 from langchain_core.tools import StructuredTool, ToolException
 from agent_service.failure import failure_info
 from agent_service.policy import active_call, mark_correctable
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from typing import Literal
 
 from agent_service.execution_adapter import ControlledShellMiddleware
 from agent_service.output import limit_output
@@ -26,6 +27,72 @@ class EditFileInput(BaseModel):
     old_text: str | None = None
 
 
+class GitInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class GitStatusInput(GitInput):
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=50, ge=1, le=100)
+
+
+class GitLogInput(GitInput):
+    revision: str = Field(default="HEAD", min_length=1, max_length=1024)
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=10, ge=1, le=50)
+
+
+class GitDiffInput(GitInput):
+    source: Literal["staged", "unstaged", "commit"]
+    commit: str | None = Field(default=None, min_length=1, max_length=1024)
+    view: Literal["files", "patch"] = "files"
+    path: str | None = Field(default=None, min_length=1)
+    start_line: int = Field(default=1, ge=1)
+    max_lines: int = Field(default=200, ge=1, le=200)
+
+    @field_validator("path")
+    @classmethod
+    def literal_path(cls, value):
+        if value is not None and (
+            value.startswith(("/", ":")) or "\x00" in value
+            or any(p in ("", ".", "..") for p in value.split("/"))
+        ):
+            raise ValueError("Expected a literal workspace-relative file path")
+        return value
+
+    @model_validator(mode="after")
+    def selected_source(self):
+        if (self.source == "commit") != (self.commit is not None):
+            raise ValueError("commit is required only for source=commit")
+        if self.view == "patch" and self.path is None:
+            raise ValueError("Patch view requires path; list files first")
+        return self
+
+
+class GitReadFileInput(GitInput):
+    source: Literal["commit", "index"]
+    path: str = Field(min_length=1)
+    commit: str | None = Field(default=None, min_length=1, max_length=1024)
+    start_line: int = Field(default=1, ge=1)
+    max_lines: int = Field(default=200, ge=1, le=200)
+
+    _literal_path = field_validator("path")(GitDiffInput.literal_path.__func__)
+
+    @model_validator(mode="after")
+    def selected_source(self):
+        if (self.source == "commit") != (self.commit is not None):
+            raise ValueError("commit is required only for source=commit")
+        return self
+
+
+GIT_DECLARATIONS = [
+    ("git_status", "Read live Git HEAD/branch and per-file staged, unstaged, untracked and conflict status. Paginate with next_offset. No atomic snapshot across calls.", GitStatusInput),
+    ("git_log", "List local reachable commit IDs, parents, author/time and title. Use returned full revision for subsequent pages; no ranges or fetching.", GitLogInput),
+    ("git_diff", "List changed files first (view=files), then read one file patch. staged compares HEAD to index; unstaged compares index to worktree; commit compares first parent to fixed commit (native root comparison). next_line indexes output, NOT source lines; use patch hunks for issue locations. No submodule interiors.", GitDiffInput),
+    ("git_read_file", "Read a UTF-8 regular blob from a fixed commit or stage 0 index, with original line numbers and object ID. No checkout/filters. Use index for staged context, read_file for worktree/untracked. Conflicts and unsupported content report errors.", GitReadFileInput),
+]
+
+
 def file_tools(scope=None):
     native = FilesystemFileSearchMiddleware(root_path="/workspace")
     declarations = [(t.name, t.description, t.args_schema) for t in native.tools]
@@ -41,6 +108,7 @@ def file_tools(scope=None):
             EditFileInput,
         ),
     ]
+    declarations += GIT_DECLARATIONS
     tools = []
     for name, description, schema in declarations:
 
@@ -56,6 +124,8 @@ def file_tools(scope=None):
                     active_call.get().diagnostic = info
                     raise ToolException(result["error"])
                 content = result.pop("content")
+                if name.startswith("git_"):
+                    return content, result
                 if result.get("truncated"):
                     content += "\n[file results truncated]"
                 if result.get("sha256"):

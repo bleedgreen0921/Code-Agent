@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-TAG = "agent-execution:workspace-v1"
+TAG = "agent-execution:workspace-v2"
 
 
 def build(*, output=None):

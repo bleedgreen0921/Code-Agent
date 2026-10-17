@@ -231,3 +231,5 @@ curl 'http://127.0.0.1:8002/v1/runs/RUN_UUID/trace?namespace='
 ## 第三批可信验证与重复错误控制
 
 core_0008 仅新增可空的 Run verification 报告。可信 Extension 可注册异步验证器，选择 report 或 required，并显式开启默认关闭的重复错误 middleware。验证在明确最终 checkpoint 后、清理前执行，报告与结果在原事务中发布。required 阶段消息不继承、后台结果不提前消费；历史 null 不代表验证通过。无新增模型调用、验证重试或修复循环。详见[行为与注册示例](docs/第三批可信验证与重复错误控制.md)及[验收](docs/第三批可信验证与重复错误控制验收.md)。
+
+Git Review 阶段二支持当前未提交改动和指定历史提交，部署、参数、限制及 API 示例见[阶段二使用说明](docs/代码能力阶段二使用说明.md)。

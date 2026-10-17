@@ -4,7 +4,7 @@ from importlib.metadata import version
 from urllib.parse import urlsplit
 
 from agent_service.profiles import fingerprint, tool_schema
-from agent_service.execution_config import IMPLEMENTATION_VERSION
+from agent_service.execution_config import IMPLEMENTATION_VERSION, WORKSPACE_TOOLS
 from agent_service.context import CONTEXT_VERSION, TODO_LIMITS, SUMMARY_VERSION
 from agent_service.skills import SKILL_VERSION
 from agent_service.knowledge import manifest as knowledge_manifest
@@ -105,14 +105,7 @@ def runtime_snapshot(model, settings, registry, binding, middleware):
                 "read_only_rootfs": True,
             }
             if set(profile.tools)
-            & {
-                "glob_search",
-                "grep_search",
-                "read_file",
-                "edit_file",
-                "shell",
-                "start_background_shell",
-            }
+            & (WORKSPACE_TOOLS | {"start_background_shell"})
             else None
         ),
         "run_timeout_seconds": settings.run_timeout,
