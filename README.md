@@ -54,6 +54,8 @@ curl -X POST http://127.0.0.1:8002/v1/conversations/CONVERSATION_UUID/turns \
 
 可选 `AGENT_RUNTIME_CONFIG` 指向 TOML 文件，由标准库 tomllib 读取并通过 Pydantic 校验，仅启动加载。参见 [配置示例](config/runtime.example.toml)。未指定时继续使用空工具的内置 chat；三个内置 Profile 均不可覆写。API 和 Worker 使用一致的注册配置，API 无需模型 Key 或模型端点。
 
+代码分析、只读 Review 和基础修复可显式启用独立的[代码任务配置](config/runtime.code.example.toml)，提供 `code-analyze`、`code-review`、`code-fix`。替换配置、依赖准备和 API 示例见[阶段一使用说明](docs/代码能力阶段一使用说明.md)，自动化证据见[阶段一验收](docs/代码能力阶段一验收.md)。
+
 ```bash
 export AGENT_RUNTIME_CONFIG=/absolute/path/to/runtime.toml
 curl -X POST http://127.0.0.1:8002/v1/runs \
