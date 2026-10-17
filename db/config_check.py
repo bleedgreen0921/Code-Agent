@@ -15,7 +15,7 @@ def main():
     if args.role == "agent-worker" and registry.execution.image:
         from agent_service.execution import check_environment
 
-        asyncio.run(check_environment(registry.execution))
+        asyncio.run(check_environment(registry.execution, checks=registry.check_definitions()))
     names = ["AGENT_DATABASE_URL"]
     if args.role == "agent-worker":
         names += ["AGENT_MODEL_URL", "AGENT_MODEL"]

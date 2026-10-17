@@ -7,3 +7,8 @@
 
 !execution/git_tools.py
 !execution/background.py
+
+!execution/checks/
+!execution/checks/*.py
+**/__pycache__/
+**/*.pyc

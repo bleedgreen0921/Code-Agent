@@ -1,0 +1,55 @@
+# Independent configuration: copy, replace all three absolute/image placeholders,
+# then set AGENT_RUNTIME_CONFIG for both API and Worker and restart both.
+version = 1
+
+[execution]
+# Build first: python -m scripts.build_execution_image
+image = "sha256:REPLACE_WITH_64_HEX_DIGITS"
+# Defaults to Worker's UID:GID; a root Worker must set a non-root user explicitly.
+# user = "1000:1000"
+cpus = 1.0
+memory_bytes = 536870912
+pids = 128
+tmp_bytes = 67108864
+command_timeout = 30.0
+cleanup_timeout = 10.0
+output_bytes = 16384
+output_lines = 200
+file_bytes = 10485760
+
+[[workspaces]]
+id = "project"
+root = "/ABSOLUTE/PATH/TO/project"
+
+[skills]
+directories = ["/ABSOLUTE/PATH/TO/agent/project_skills"]
+
+[[profiles]]
+id = "code-analyze"
+requires_workspace = true
+tools = ["glob_search", "grep_search", "read_file", "read_skill", "write_todos"]
+skills = ["code-analyze"]
+system_prompt = "你负责只读代码分析。开始处理时调用 read_skill 读取 code-analyze。最终使用 Markdown 章节：结论；关键代码与调用关系；执行和异常路径；证据与未确认事项。"
+
+[[profiles]]
+id = "code-review"
+requires_workspace = true
+tools = ["glob_search", "grep_search", "read_file", "read_skill", "write_todos", "git_status", "git_log", "git_diff", "git_read_file"]
+skills = ["code-review"]
+system_prompt = "你负责只读代码审查。开始处理时调用 read_skill 读取 code-review。最终使用 Markdown 章节：审查结论；问题清单；审查范围与未确认事项。"
+
+[[profiles]]
+id = "code-fix"
+requires_workspace = true
+tools = ["glob_search", "grep_search", "read_file", "read_skill", "write_todos", "edit_file", "shell", "git_status", "git_diff"]
+skills = ["code-fix"]
+system_prompt = "你负责根据明确需求修复代码。开始处理时调用 read_skill 读取 code-fix。最终使用 Markdown 章节：修复摘要；修改内容；检查结果；遗留问题。"
+
+# Explicitly enables the trusted Python registration in Registry.from_env.
+# The fixed gate is bound to the registered project workspace only.
+[[profiles]]
+id = "code-fix-checked"
+requires_workspace = true
+tools = ["glob_search", "grep_search", "read_file", "read_skill", "write_todos", "edit_file", "shell", "git_status", "git_diff"]
+skills = ["code-fix"]
+system_prompt = "你负责修复 Python 示例。开始时调用 read_skill 读取 code-fix。开发期间使用 Shell 检查真实反馈并继续修正；最终成功由 required verification 的固定检查决定，最终验证失败不再调用模型。最终使用 Markdown 章节：修复摘要；修改内容；检查结果；遗留问题。"

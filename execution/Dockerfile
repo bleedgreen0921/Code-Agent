@@ -7,6 +7,9 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources && \
 COPY requirements.lock /opt/agent/requirements.lock
 RUN pip install --no-cache-dir -r /opt/agent/requirements.lock
 COPY execution/git_tools.py execution/helper.py execution/entrypoint.py execution/background.py /opt/agent/
+COPY execution/checks /opt/agent/checks
+RUN chmod 0555 /opt/agent/checks && chmod 0444 /opt/agent/checks/*.py
+LABEL io.agent-framework.checks="python-repair-v1"
 LABEL io.agent-framework.helper="workspace-v2" io.agent-framework.background="background-v1"
 ENV PATH="/usr/local/bin:/usr/bin:/bin" LANG="C.UTF-8" HOME="/tmp" TMPDIR="/tmp"
 WORKDIR /workspace

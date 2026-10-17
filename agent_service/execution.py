@@ -156,6 +156,9 @@ class ExecutionScope:
                 != IMPLEMENTATION_VERSION
             ):
                 raise EnvironmentUnavailable("Execution image helper version mismatch")
+            from agent_service.checks import validate_image_checks
+
+            validate_image_checks(image, self.row.get("submitted_binding", {}).get("checks", ()))
             root = self.resource["workspace_root"]
             if (
                 str(Path(root).resolve(strict=True)) != root
@@ -458,7 +461,7 @@ async def recover_resources(store, settings):
             )
 
 
-async def check_environment(settings):
+async def check_environment(settings, *, checks=()):
     """Worker-only preflight. API configuration parsing never calls this."""
     if not settings.image:
         raise EnvironmentUnavailable("Immutable execution image is required")
@@ -473,6 +476,9 @@ async def check_environment(settings):
             != IMPLEMENTATION_VERSION
         ):
             raise EnvironmentUnavailable("Execution image helper version mismatch")
+        from agent_service.checks import validate_image_checks
+
+        validate_image_checks(image, checks)
         return daemon
     except (OSError, ValueError, TimeoutError) as exc:
         raise EnvironmentUnavailable(str(exc)) from exc

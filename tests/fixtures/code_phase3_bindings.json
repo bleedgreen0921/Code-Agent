@@ -1,0 +1,38 @@
+{
+  "chat": {
+    "version": 1,
+    "profile": "chat",
+    "profile_fingerprint": "90e706261dfe701f788d7593c7259b328f36574e2a73402777becec784d3eeea",
+    "workspace_id": "project"
+  },
+  "workspace_read": {
+    "version": 1,
+    "profile": "workspace_read",
+    "profile_fingerprint": "51a93d60025506b251620bc69b760e1633893fc9477734d2fac43a0b98e41ac3",
+    "workspace_id": "project"
+  },
+  "workspace_write": {
+    "version": 1,
+    "profile": "workspace_write",
+    "profile_fingerprint": "f46ee444dbe292676faec340b7d05921507f1a0d1184de326d28827df02f6fb2",
+    "workspace_id": "project"
+  },
+  "code-analyze": {
+    "version": 1,
+    "profile": "code-analyze",
+    "profile_fingerprint": "65d0dc9aba90f4e01b25c855639292fb591769528049f44cd1050701a3361974",
+    "workspace_id": "project"
+  },
+  "code-review": {
+    "version": 1,
+    "profile": "code-review",
+    "profile_fingerprint": "fd5ad38532724364e086c1700f0a66d66de4711f51c526e3526406ad5baf4222",
+    "workspace_id": "project"
+  },
+  "code-fix": {
+    "version": 1,
+    "profile": "code-fix",
+    "profile_fingerprint": "4c0b0600382a9bf7f25f5236980473a8cf9ca2415cb7812ed4ec9b243558da5d",
+    "workspace_id": "project"
+  }
+}

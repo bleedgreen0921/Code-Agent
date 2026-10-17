@@ -720,8 +720,10 @@ class Worker:
     async def run(self):
         if self.resources.registry.execution.image:
             try:
-                await check_environment(self.resources.registry.execution)
+                await check_environment(self.resources.registry.execution, checks=self.resources.registry.check_definitions())
             except EnvironmentUnavailable:
+                if self.resources.registry.check_definitions():
+                    raise
                 # A broken workspace environment must not prevent empty-tool chat runs.
                 # Workspace runs perform their own fatal preflight before any model call.
                 log.exception("execution_environment_preflight_failed")

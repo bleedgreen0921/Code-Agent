@@ -70,3 +70,7 @@ Thumbs.db
 # Local experiment output
 /examples/amc_experiments/*
 !/examples/amc_experiments/README.md
+!/docs/代码能力阶段三使用说明.md
+!/docs/代码能力阶段三验收.md
+!/docs/代码能力阶段四使用说明.md
+!/docs/代码能力阶段四验收.md

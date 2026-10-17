@@ -7,7 +7,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 
 from pydantic import (
     BaseModel,
@@ -22,6 +22,9 @@ from agent_service.execution_errors import ExecutionFailure
 from agent_service.failure import is_control, control_leaf
 from agent_service.output import limit_output
 from agent_service.reliability import remaining_execution
+
+if TYPE_CHECKING:
+    from agent_service.checks import CheckExecutionResult
 
 log = logging.getLogger(__name__)
 MAX_REPORT_BYTES = 32768
@@ -173,12 +176,18 @@ class VerificationContext:
     checkpoint: CheckpointReference
     _remaining: Callable = field(repr=False, compare=False)
     _read: Callable = field(repr=False, compare=False)
+    _run_check: Callable | None = field(default=None, repr=False, compare=False)
 
     def remaining_execution(self):
         return self._remaining()
 
     async def read_file(self, path, *, start_line=1, max_lines=200):
         return await self._read(path, start_line=start_line, max_lines=max_lines)
+
+    async def run_check(self, check_id: str) -> "CheckExecutionResult":
+        if self._run_check is None:
+            raise VerificationContractError("No controlled checks are registered")
+        return await self._run_check(check_id)
 
 
 def normalize_path(path):
@@ -409,7 +418,10 @@ async def verify(row, registry, store, context, scope, answer, checkpoint):
     final_candidate = await store.verification_candidate(
         row["id"], row.get("_delivered", ())
     )
+    from agent_service.checks import CheckAccess
+
     access = FileAccess(row, registry, context, scope)
+    checks = CheckAccess(access, extension)
     error = None
     if not final_candidate:
         result = VerificationResult(status="not_checked", reason="stage_report")
@@ -430,6 +442,7 @@ async def verify(row, registry, store, context, scope, answer, checkpoint):
             reference,
             lambda: remaining_execution(row),
             access.read,
+            checks.run,
         )
         timer = asyncio.timeout(
             min(extension.verification_timeout, remaining_execution(row))
@@ -457,6 +470,7 @@ async def verify(row, registry, store, context, scope, answer, checkpoint):
                     raise VerificationContractError(
                         "Invalid verifier result serialization"
                     ) from exc
+                result = checks.enforce(result)
                 async with access.lock:
                     await access.recheck()
                 if access.violation:
@@ -520,7 +534,7 @@ async def verify(row, registry, store, context, scope, answer, checkpoint):
                     extra={"run_id": row["id"], "error_code": error},
                 )
         finally:
-            access.open = False
+            checks.close()
     remaining_execution(row)
     try:
         report = VerificationReport(

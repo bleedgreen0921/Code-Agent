@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, ConfigDict, Field
@@ -47,6 +47,10 @@ from agent_service.context import (
     TODO_VERSION,
     CONTEXT_VERSION,
 )
+
+
+if TYPE_CHECKING:
+    from agent_service.checks import CheckDefinition
 
 
 def fingerprint(value):
@@ -106,6 +110,7 @@ class Extension:
     verifier: Callable | None = None
     verification_timeout: float = 10.0
     no_progress_enabled: bool = False
+    checks: tuple["CheckDefinition", ...] = ()
 
     def __post_init__(self):
         if (
@@ -138,6 +143,19 @@ class Extension:
                 raise ValueError(
                     "Verifier must accept context, answer, checkpoint"
                 ) from exc
+        if type(self.checks) is not tuple:
+            raise ValueError("Check definitions must be an immutable tuple")
+        if self.checks:
+            from agent_service.checks import CheckDefinition
+
+            if self.verification_mode is None or self.verifier is None:
+                raise ValueError("Checks need enabled verification and a verifier")
+            if any(type(check) is not CheckDefinition for check in self.checks):
+                raise ValueError("Checks require trusted CheckDefinition values")
+            if len(self.checks) > 16 or len({c.id for c in self.checks}) != len(self.checks):
+                raise ValueError("Duplicate or excessive check definitions")
+            for check in self.checks:
+                check.validate_registration()
         if self.verification_mode == "required" and self.verifier is None:
             raise ValueError("required verification needs a registered verifier")
 
@@ -159,6 +177,7 @@ class Extension:
                 else {}
             ),
             **({"no_progress": manifest()} if self.no_progress_enabled else {}),
+            **({"checks": [c.manifest() for c in self.checks]} if self.checks else {}),
         }
 
 
@@ -306,6 +325,21 @@ class Registry:
                 > CATALOG_BYTES
             ):
                 raise ValueError("Profile skill catalog exceeds 8 KiB")
+        for profile in profiles.values():
+            extension = self.extensions.get(profile.id)
+            if profile.id == "code-fix-checked" and (
+                extension is None or extension.verification_mode != "required"
+                or len(extension.checks) != 1
+            ):
+                raise ValueError("code-fix-checked requires its trusted verifier and fixed check")
+            if extension and extension.checks:
+                if not self.execution.image:
+                    raise ValueError("Check Profile requires an immutable execution image")
+                if not profile.requires_workspace or not {"shell", "read_file"} <= set(profile.tools):
+                    raise ValueError("Check Profile requires workspace, shell and read_file permissions")
+                for check in extension.checks:
+                    if set(check.workspaces) - workspaces.keys():
+                        raise ValueError("Required check workspace is not registered")
         self.profiles = MappingProxyType(profiles)
         self.workspaces = MappingProxyType(workspaces)
 
@@ -323,7 +357,20 @@ class Registry:
                     profile[key] = tuple(profile[key])
         if isinstance(raw.get("skills", {}).get("directories"), list):
             raw["skills"]["directories"] = tuple(raw["skills"]["directories"])
-        return cls(RuntimeFile.model_validate(raw), **trusted)
+        config = RuntimeFile.model_validate(raw)
+        if any(p.id == "code-fix-checked" for p in config.profiles):
+            from agent_service.checks import first_n_check, fixed_verifier
+
+            extensions = dict(trusted.get("extensions") or {})
+            extensions.setdefault("code-fix-checked", Extension(
+                version="python-repair-1", verification_mode="required",
+                verification_timeout=10.0, verifier=fixed_verifier, checks=(first_n_check(),),
+            ))
+            trusted["extensions"] = extensions
+        return cls(config, **trusted)
+
+    def check_definitions(self):
+        return tuple(check.manifest() for extension in self.extensions.values() for check in extension.checks)
 
     def bind(self, profile="chat", workspace_id=None):
         if profile not in self.profiles:
@@ -337,6 +384,9 @@ class Registry:
             & (WORKSPACE_TOOLS | KNOWLEDGE_TOOLS | {"start_background_shell"})
         ) and workspace_id is None:
             raise ValueError("Profile requires a workspace")
+        extension = self.extensions.get(profile)
+        if extension and any(workspace_id not in c.workspaces for c in extension.checks):
+            raise ValueError("Workspace is not allowed for this check Profile")
         root = self.workspaces.get(workspace_id)
         tool_schemas = {
             name: fingerprint(tool_schema(self.tools[name]))
