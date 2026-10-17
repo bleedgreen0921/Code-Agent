@@ -238,3 +238,64 @@ async def cancel_operation(
     row = await db(request).cancel_operation(task_id, operation_id)
     response.status_code = 202 if row["state"] == "cancelling" else 200
     return row
+
+
+from contracts.code import CodeTaskCreate
+
+
+@router.post("/code/tasks")
+async def create_code_task(
+    body: CodeTaskCreate,
+    request: Request,
+    response: Response,
+    key: str | None = Header(None, alias="Idempotency-Key"),
+):
+    row, replay = await db(request).create_code_task(body, key)
+    response.status_code = 200 if replay else 202
+    return row
+
+
+@router.get("/code/tasks/{task_id}")
+async def code_task(task_id: UUID, request: Request):
+    return await db(request).code_task(task_id)
+
+
+@router.get("/code/tasks/{task_id}/checks")
+async def code_checks(
+    task_id: UUID,
+    request: Request,
+    limit: int = Query(30, ge=1, le=100),
+    cursor: UUID | None = None,
+):
+    return await db(request).code_page(task_id, "checks", limit, cursor)
+
+
+@router.get("/code/tasks/{task_id}/artifacts")
+async def code_artifacts(
+    task_id: UUID,
+    request: Request,
+    limit: int = Query(30, ge=1, le=100),
+    cursor: UUID | None = None,
+):
+    return await db(request).code_page(task_id, "artifacts", limit, cursor)
+
+
+@router.get("/code/tasks/{task_id}/artifacts/{artifact_id}")
+async def code_artifact(task_id: UUID, artifact_id: UUID, request: Request):
+    metadata, data = await db(request).code_artifact(task_id, artifact_id)
+    media = (
+        "text/markdown; charset=utf-8"
+        if metadata["kind"] == "analysis_markdown"
+        else "application/json"
+        if metadata["kind"] in ("analysis_report", "source_evidence", "check_result")
+        else "text/plain; charset=utf-8"
+    )
+    return Response(
+        data,
+        media_type=media,
+        headers={
+            "Content-Disposition": f'attachment; filename="{artifact_id}"',
+            "ETag": '"' + metadata["sha256"] + '"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )

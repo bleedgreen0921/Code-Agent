@@ -93,12 +93,16 @@ _register(
 )
 _register(
     "GIT_ARGUMENTS_INVALID GIT_REFERENCE_INVALID",
-    "parameter", "not_dispatched", "correct_arguments",
+    "parameter",
+    "not_dispatched",
+    "correct_arguments",
     "Git arguments or commit reference are invalid.",
 )
 _register(
     "GIT_REPOSITORY_UNAVAILABLE GIT_UNSUPPORTED GIT_INDEX_CONFLICT GIT_FILE_NOT_FOUND GIT_READ_FAILED",
-    "execution", "not_applicable", "stop",
+    "execution",
+    "not_applicable",
+    "stop",
     "Git source could not be fully read; review coverage is incomplete.",
 )
 _register(
@@ -242,6 +246,36 @@ _register(
     "unknown",
     "reconcile_original",
     "Original resource observation or cancellation is not confirmed.",
+)
+
+
+_register(
+    "CODE_TASK_REQUIRED",
+    "parameter",
+    "not_dispatched",
+    "correct_arguments",
+    "Use the dedicated code task endpoint.",
+)
+_register(
+    "SNAPSHOT_UNSUPPORTED SNAPSHOT_UNSTABLE SNAPSHOT_INVALID SNAPSHOT_LIMIT",
+    "execution",
+    "not_applicable",
+    "stop",
+    "Source snapshot could not be safely sealed or verified.",
+)
+_register(
+    "ARTIFACT_INVALID ARTIFACT_LIMIT REPORT_INVALID",
+    "verification",
+    "not_applicable",
+    "stop",
+    "Managed evidence or analysis report could not be verified.",
+)
+_register(
+    "CHECK_RESULT_UNKNOWN",
+    "persistence",
+    "unknown",
+    "reconcile_original",
+    "Original check execution is unconfirmed and must not be replayed.",
 )
 
 

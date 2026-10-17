@@ -16,6 +16,7 @@ from agent_service.profiles import Registry
 from agent_service.tasks import TaskStore
 from agent_service.background_store import BackgroundStore
 from agent_service.diagnostics import DiagnosticStore
+from agent_service.code_store import CodeStore
 
 log = logging.getLogger(__name__)
 ACTIVE = ("queued", "running", "cancelling")
@@ -23,7 +24,7 @@ TERMINAL = ("completed", "failed", "cancelled")
 ADMISSION_LOCK = 81431002
 
 
-class Store(TaskStore, BackgroundStore, DiagnosticStore):
+class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
     def __init__(self, pool, settings, registry=None):
         self.pool, self.settings = pool, settings
         self.registry = registry or Registry.from_env()
@@ -39,7 +40,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
             revisions = await (
                 await conn.execute("SELECT version_num FROM agent.alembic_version")
             ).fetchall()
-            if revisions != [{"version_num": "core_0008"}]:
+            if revisions != [{"version_num": "core_0009"}]:
                 raise RuntimeError("Core database baseline required")
             await conn.execute("SELECT 1 FROM agent.checkpoints LIMIT 1")
             await conn.execute("SELECT 1 FROM agent.store LIMIT 1")
@@ -55,7 +56,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
                     signature[key] = [list(r.values()) for r in rows]
             if (
                 signature
-                != json.loads((ROOT / "structure.json").read_text())["core_0008"]
+                != json.loads((ROOT / "structure.json").read_text())["core_0009"]
             ):
                 raise RuntimeError("Core structure mismatch")
             from langgraph.store.postgres import PostgresStore
@@ -92,6 +93,16 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
                 raise RuntimeError(
                     "A separate runtime role without migration permissions is required"
                 )
+        if self.registry.code.settings.enabled:
+            root = Path(self.registry.code.settings.storage_root)
+            import os
+
+            if (
+                not root.is_dir()
+                or str(root.resolve()) != str(root)
+                or not os.access(root, os.W_OK | os.X_OK)
+            ):
+                raise RuntimeError("Managed code storage is unavailable")
         return True
 
     async def event(self, conn, run_id, status, error_code=None):
@@ -148,11 +159,20 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
             )
 
         await self.reconcile_tasks(conn)
+        await self.reconcile_code_tasks(conn)
 
     async def maintain(self):
         async with self.locked() as conn:
             await self.sweep(conn)
             await self.schedule_tasks(conn)
+
+    def require_code_entry(self, profile, *, code_task=False):
+        from agent_service.code_registry import PROFILE
+
+        if profile == PROFILE and not code_task:
+            raise ApiError(
+                422, "CODE_TASK_REQUIRED", "Use POST /v1/code/tasks for this profile"
+            )
 
     def binding(self, profile="chat", workspace_id=None):
         try:
@@ -161,6 +181,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
             raise ApiError(422, ErrorCode.INVALID_REQUEST, str(exc)) from exc
 
     async def create_conversation(self, title, profile="chat", workspace_id=None):
+        self.require_code_entry(profile)
         binding = self.binding(profile, workspace_id)
         async with self.pool.connection() as conn:
             return await (
@@ -208,6 +229,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
     ):
         if key is not None and (not key.strip() or len(key) > 200):
             raise ApiError(422, ErrorCode.INVALID_REQUEST, "Invalid Idempotency-Key")
+        self.require_code_entry(profile)
         scope = str(conversation_id) if conversation_id else "standalone"
         async with self.locked() as conn:
             await self.sweep(conn)
@@ -246,6 +268,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
                     conversation["profile"],
                     conversation["workspace_id"],
                 )
+                self.require_code_entry(profile)
                 try:
                     binding = self.registry.bind(profile, workspace_id)
                 except ValueError as exc:
@@ -444,6 +467,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
             occupied = await (
                 await conn.execute(
                     """SELECT e.run_id,r.task_id,e.workspace_root FROM agent.execution_resources e JOIN agent.runs r ON r.id=e.run_id WHERE e.state<>'released'
+                    UNION ALL SELECT e.run_id,r.task_id,e.workspace_root FROM agent.code_execution_resources e JOIN agent.runs r ON r.id=e.run_id WHERE e.state<>'released'
                     UNION ALL SELECT run_id,task_id,workspace_root FROM agent.background_operations WHERE backend='docker' AND cleanup_state<>'released'"""
                 )
             ).fetchall()
@@ -452,6 +476,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
                     await conn.execute("""SELECT count(*) AS n FROM (
                 SELECT id FROM agent.runs WHERE status IN ('running','cancelling')
                 UNION SELECT run_id FROM agent.execution_resources WHERE state <> 'released'
+                UNION SELECT run_id FROM agent.code_execution_resources WHERE state <> 'released'
             ) capacity""")
                 ).fetchone()
             )["n"]
@@ -496,7 +521,12 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
                     (
                         worker_id,
                         token,
-                        self.settings.run_timeout,
+                        min(
+                            self.settings.run_timeout,
+                            self.registry.code.settings.run_seconds,
+                        )
+                        if selected["profile"] == self.registry.code.settings.profile
+                        else self.settings.run_timeout,
                         self.settings.lease_seconds,
                         selected["id"],
                     ),
@@ -645,6 +675,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
         verification=None,
         candidate_answer=None,
         candidate_checkpoint=None,
+        code_artifacts=None,
     ):
         async with self.locked() as conn:
             await self.sweep(conn)
@@ -698,8 +729,9 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
                     )
                 occupied = await (
                     await conn.execute(
-                        "SELECT 1 FROM agent.execution_resources WHERE run_id=%s AND state<>'released'",
-                        (run_id,),
+                        """SELECT 1 FROM agent.execution_resources WHERE run_id=%s AND state<>'released'
+                        UNION ALL SELECT 1 FROM agent.code_execution_resources WHERE run_id=%s AND state<>'released'""",
+                        (run_id, run_id),
                     )
                 ).fetchone()
                 if occupied:
@@ -758,6 +790,14 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore):
                     ),
                 )
             ).fetchone()
+            if (
+                published
+                and status == "completed"
+                and row["profile"] == self.registry.code.settings.profile
+            ):
+                if not code_artifacts:
+                    raise ValueError("A code task requires staged report artifacts")
+                await self.publish_code_report(conn, row, code_artifacts)
             if not published:
                 await self.sweep(conn)
                 return False

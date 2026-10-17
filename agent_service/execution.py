@@ -47,7 +47,15 @@ class DockerClient:
     def __init__(self):
         self.processes = set()
 
-    async def call(self, *args, stdin=None, timeout=10, maximum=65536, check=True):
+    async def call(
+        self,
+        *args,
+        stdin=None,
+        timeout=10,
+        maximum=65536,
+        check=True,
+        timeout_result=False,
+    ):
         proc = await asyncio.create_subprocess_exec(
             "docker",
             *args,
@@ -61,8 +69,10 @@ class DockerClient:
         )
         self.processes.add(proc)
 
+        collected = {}
+
         async def drain(stream):
-            output = bytearray()
+            output = collected[stream] = bytearray()
             while chunk := await stream.read(4096):
                 if len(output) < maximum:
                     output.extend(chunk[: maximum - len(output)])
@@ -83,6 +93,14 @@ class DockerClient:
             if check and proc.returncode:
                 raise EnvironmentUnavailable(err.decode("utf-8", "replace")[:500])
             return proc.returncode, out, err
+        except TimeoutError:
+            if timeout_result:
+                return (
+                    124,
+                    bytes(collected.get(proc.stdout, b"")),
+                    bytes(collected.get(proc.stderr, b"")),
+                )
+            raise
         finally:
             if proc.returncode is None:
                 proc.kill()
@@ -158,8 +176,12 @@ class ExecutionScope:
                 raise EnvironmentUnavailable("Execution image helper version mismatch")
             from agent_service.checks import validate_image_checks
 
-            validate_image_checks(image, self.row.get("submitted_binding", {}).get("checks", ()))
-            root = self.resource["workspace_root"]
+            validate_image_checks(
+                image, self.row.get("submitted_binding", {}).get("checks", ())
+            )
+            root = (
+                self.resource.get("execution_root") or self.resource["workspace_root"]
+            )
             if (
                 str(Path(root).resolve(strict=True)) != root
                 or not Path(root).is_dir()
@@ -170,7 +192,7 @@ class ExecutionScope:
                 )
             await self.update(daemon_id=daemon, phase="creating")
             name = self.resource["container_name"]
-            readonly = not bool(
+            readonly = getattr(self, "force_readonly", False) or not bool(
                 set(self.row["execution_tools"]) & {"edit_file", "shell"}
             )
             mount = f"type=bind,source={root},target=/workspace" + (
@@ -210,7 +232,9 @@ class ExecutionScope:
                 "--log-driver",
                 "none",
             ]
-            for key, value in FIXED_ENV.items():
+            for extra in getattr(self, "extra_mounts", ()):
+                command += ["--mount", extra]
+            for key, value in {**FIXED_ENV, **getattr(self, "fixed_env", {})}.items():
                 command += ["--env", f"{key}={value}"]
             command += [
                 "--entrypoint",
@@ -274,6 +298,11 @@ class ExecutionScope:
             stdin=json.dumps(
                 {
                     "operation": name,
+                    **(
+                        {"evidence_mode": True}
+                        if getattr(self, "evidence", None)
+                        else {}
+                    ),
                     "args": args,
                     "file_bytes": self.settings.file_bytes,
                     "output_bytes": self.settings.output_bytes,

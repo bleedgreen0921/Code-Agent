@@ -1,0 +1,35 @@
+# Use the same file and trusted Python registration for API and Worker:
+# python -m scripts.code_analysis_example --role api|worker|doctor
+version = 1
+
+[execution]
+# Build with python -m scripts.build_execution_image; paste its immutable ID.
+image = "sha256:REPLACE_WITH_64_HEX_DIGITS"
+# user = "1000:1000"
+
+[[workspaces]]
+id = "project"
+root = "/ABSOLUTE/PATH/TO/project"
+
+[code_analysis]
+enabled = true
+# Existing canonical directory outside every registered workspace.
+# API, Worker and Docker must share the same host and paths.
+storage_root = "/ABSOLUTE/PATH/TO/managed-code-analysis"
+model_calls = 16
+tool_calls = 32
+check_calls = 12
+run_seconds = 300
+snapshot_seconds = 60
+check_seconds = 60
+reserve_seconds = 30
+
+# IDs below are registered by scripts.code_analysis_example.PROJECT_CHECKS.
+[code_analysis.check_suites]
+project-python = ["project-unittest", "project-pytest"]
+
+[code_analysis.workspace_suites]
+project = ["project-python"]
+
+[code_analysis.default_suites]
+project = "project-python"

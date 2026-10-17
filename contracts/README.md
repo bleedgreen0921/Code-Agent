@@ -69,3 +69,23 @@ Run、后台操作、同步外部操作投影增加 `failure_info`，历史值�
 ### 可选验证报告（core_0008）
 
 Run 详情、列表和 trace 增加 verification；Task 详情关联 current_run_id 已发布报告。未发布及历史记录为 null，不推断为 passed。报告与 result 在同一事务发布，失败 Run 的 result 仍为 null；报告 checkpoint 仅是候选证据。状态集合、提交请求和错误 envelope 不变，无验证触发/覆盖/重跑接口。可信注册、严格报告及 required 阶段继承语义见[第三批说明](../docs/第三批可信验证与重复错误控制.md)。
+
+
+## 隔离代码分析（可选）
+
+`POST /v1/code/tasks` 仅接受 `stage="analysis"`、`task`、`workspace_id`、
+`target={"kind":"workspace"}` 或 `{"kind":"commit","ref":"local-ref"}`、
+`context_task_ids`（至多 8 个同工作区代码分析任务）和可选 `check_suite_id`。
+同一个 Idempotency-Key 的所有请求字段参与摘要；不同请求返回 409。
+服务端选择 code-analysis-isolated Profile；其他 Run/Task/Conversation 入口返回
+422 / CODE_TASK_REQUIRED。未注册检查集允许静态分析；未知或未授权检查集返回 422。
+
+新增 GET `/v1/code/tasks/{task_id}`、`/checks`、`/artifacts` 及
+`/artifacts/{artifact_id}`；列表使用 `limit` / UUID `cursor`。下载只按所属任务和 ID
+查找，不接收路径、不返回宿主机存储键；不存在或跨任务 404，内容过期 410，
+内容损坏或丢失 409 / ARTIFACT_INVALID。检查日志在执行结束后可查询，正式报告仅在
+清理全部容器且租约有效的 Run 完成事务中发布。任务取消和 timeline 复用原 `/v1/tasks`。
+
+报告契约见 contracts/code.py。模型仅填写 AnalysisReportV1；服务端补充任务、Run、
+快照、提交、检查结果、正式产物 ID。源码引用必须来自本 Run 实际读取的完整行，
+Git index/commit 引用须明确标记来源。执行结论引用服务端检查记录。

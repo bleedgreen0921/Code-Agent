@@ -54,7 +54,8 @@ class GitDiffInput(GitInput):
     @classmethod
     def literal_path(cls, value):
         if value is not None and (
-            value.startswith(("/", ":")) or "\x00" in value
+            value.startswith(("/", ":"))
+            or "\x00" in value
             or any(p in ("", ".", "..") for p in value.split("/"))
         ):
             raise ValueError("Expected a literal workspace-relative file path")
@@ -86,10 +87,26 @@ class GitReadFileInput(GitInput):
 
 
 GIT_DECLARATIONS = [
-    ("git_status", "Read live Git HEAD/branch and per-file staged, unstaged, untracked and conflict status. Paginate with next_offset. No atomic snapshot across calls.", GitStatusInput),
-    ("git_log", "List local reachable commit IDs, parents, author/time and title. Use returned full revision for subsequent pages; no ranges or fetching.", GitLogInput),
-    ("git_diff", "List changed files first (view=files), then read one file patch. staged compares HEAD to index; unstaged compares index to worktree; commit compares first parent to fixed commit (native root comparison). next_line indexes output, NOT source lines; use patch hunks for issue locations. No submodule interiors.", GitDiffInput),
-    ("git_read_file", "Read a UTF-8 regular blob from a fixed commit or stage 0 index, with original line numbers and object ID. No checkout/filters. Use index for staged context, read_file for worktree/untracked. Conflicts and unsupported content report errors.", GitReadFileInput),
+    (
+        "git_status",
+        "Read live Git HEAD/branch and per-file staged, unstaged, untracked and conflict status. Paginate with next_offset. No atomic snapshot across calls.",
+        GitStatusInput,
+    ),
+    (
+        "git_log",
+        "List local reachable commit IDs, parents, author/time and title. Use returned full revision for subsequent pages; no ranges or fetching.",
+        GitLogInput,
+    ),
+    (
+        "git_diff",
+        "List changed files first (view=files), then read one file patch. staged compares HEAD to index; unstaged compares index to worktree; commit compares first parent to fixed commit (native root comparison). next_line indexes output, NOT source lines; use patch hunks for issue locations. No submodule interiors.",
+        GitDiffInput,
+    ),
+    (
+        "git_read_file",
+        "Read a UTF-8 regular blob from a fixed commit or stage 0 index, with original line numbers and object ID. No checkout/filters. Use index for staged context, read_file for worktree/untracked. Conflicts and unsupported content report errors.",
+        GitReadFileInput,
+    ),
 ]
 
 
@@ -123,6 +140,13 @@ def file_tools(scope=None):
                         mark_correctable(info["code"])
                     active_call.get().diagnostic = info
                     raise ToolException(result["error"])
+                if getattr(scope, "evidence", None) and name in (
+                    "read_file",
+                    "git_read_file",
+                ):
+                    return await scope.evidence.read_result(
+                        name, args, result, scope.settings
+                    )
                 content = result.pop("content")
                 if name.startswith("git_"):
                     return content, result

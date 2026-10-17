@@ -59,6 +59,7 @@ class ExecutionResult:
     checkpoint: dict
     verification: dict | None = None
     error_code: str | None = None
+    code_artifacts: dict | None = None
 
     def publication(self):
         return {
@@ -66,6 +67,7 @@ class ExecutionResult:
             "checkpoint": self.checkpoint,
             "verification": self.verification,
             "error_code": self.error_code,
+            **({"code_artifacts": self.code_artifacts} if self.code_artifacts else {}),
         }
 
 
@@ -134,6 +136,10 @@ class Worker:
                 )
             row["execution_tools"] = profile.tools
             await scope.prepare()
+            if getattr(scope, "evidence", None):
+                from agent_service.project_checks import project_check_tool
+
+                actual_tools["run_project_check"] = project_check_tool(scope)
             instances, native_middleware = assemble(scope, profile.tools)
             actual_tools.update({tool.name: tool for tool in instances})
             execution_middleware = [
@@ -182,6 +188,22 @@ class Worker:
         snapshot = runtime_snapshot(
             self.model, self.settings, registry, binding, middleware
         )
+        if row.get("_code_scope"):
+            snapshot["code_analysis"] = registry.code.manifest
+            snapshot["middleware"].update(
+                model_call_limit=registry.code.settings.model_calls,
+                tool_call_limit=registry.code.settings.tool_calls,
+            )
+            snapshot["execution"].update(
+                snapshot_id=str(row["_snapshot_id"]),
+                mount_identity=row["_code_scope"].manifest["content_digest"],
+                git_view_digest=row["_code_scope"].manifest["git_digest"],
+                read_only_workspace=True,
+            )
+            snapshot["run_timeout_seconds"] = min(
+                self.settings.run_timeout, registry.code.settings.run_seconds
+            )
+            snapshot["deadline_at"] = row["deadline_at"].isoformat()
         # Retry only the DB operation, before invoking the graph even once.
         for attempt in range(3):
             try:
@@ -206,6 +228,14 @@ class Worker:
         ]
         if len(names) != len(set(names)):
             raise ValueError("Duplicate runtime tool names")
+        code_scope = row.get("_code_scope")
+        response_format = extension.response_format
+        if code_scope:
+            from langchain.agents.structured_output import ToolStrategy
+
+            response_format = ToolStrategy(
+                code_scope.evidence.response_schema(), handle_errors=True
+            )
         graph = build_agent(
             self.model,
             checkpointer=self.resources.checkpointer,
@@ -215,7 +245,15 @@ class Worker:
             system_prompt=profile.system_prompt,
             middleware=middleware,
             state_schema=extension.state_schema,
-            response_format=extension.response_format,
+            response_format=response_format,
+            **(
+                {
+                    "model_call_limit": registry.code.settings.model_calls,
+                    "tool_call_limit": registry.code.settings.tool_calls,
+                }
+                if code_scope
+                else {}
+            ),
             permission_policy=policy,
             execution_middleware=execution_middleware,
             output_limits=(
@@ -234,7 +272,9 @@ class Worker:
             else None,
             profile=profile.id,
             workspace_id=binding["workspace_id"],
-            workspace_root=registry.workspaces.get(binding["workspace_id"]),
+            workspace_root=str(code_scope.snapshot_root)
+            if code_scope
+            else registry.workspaces.get(binding["workspace_id"]),
             workspace_identity=binding["workspace_identity"],
             binding_fingerprint=binding["fingerprint"],
             deadline_at=row["deadline_at"],
@@ -308,6 +348,29 @@ class Worker:
                     )
                 ),
             ]
+        if code_scope := row.get("_code_scope"):
+            metadata = row["_code"]
+            messages.append(
+                HumanMessage(
+                    content="Code analysis authority: "
+                    + json.dumps(
+                        {
+                            "snapshot_id": str(row["_snapshot_id"]),
+                            "commit_sha": code_scope.manifest["commit_sha"],
+                            "target": metadata["request"]["target"],
+                            "checks": [
+                                self.resources.registry.code.checks[c].manifest()
+                                for c in metadata["check_ids"]
+                            ],
+                            "checks_notice": "No checks configured; report static analysis only."
+                            if not metadata["check_ids"]
+                            else "Only these registered checks are authorized.",
+                            "context_notice": "Dependency reports are external context, not verified source evidence for this snapshot.",
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            )
         config = run_config(row["id"])
         config["callbacks"] = [row["_reported_usage"]]
         remaining_execution(context)
@@ -326,7 +389,19 @@ class Worker:
             raise IncompleteGraphError(
                 "Graph interrupted; no HTTP resume endpoint is enabled"
             )
-        if "structured_response" in state and not row.get("task_id"):
+        if row.get("_code_scope"):
+            if "structured_response" not in state:
+                raise IncompleteGraphError("Code analysis requires a structured report")
+            scope = row["_code_scope"]
+            report = await scope.evidence.verify_persisted(state["structured_response"])
+            from agent_service.code_reports import markdown_report
+
+            authority = scope.evidence.authority()
+            answer = markdown_report(report, authority)
+            row["_code_artifacts"] = await self.db.stage_code_report(
+                row, report, answer, authority
+            )
+        elif "structured_response" in state and not row.get("task_id"):
             from fastapi.encoders import jsonable_encoder
 
             answer = json.dumps(
@@ -354,7 +429,9 @@ class Worker:
             row, self.resources.registry, self.db, context, scope, answer, checkpoint
         )
         row["_verification"] = report
-        return ExecutionResult(answer, checkpoint, report, error)
+        return ExecutionResult(
+            answer, checkpoint, report, error, row.get("_code_artifacts")
+        )
 
     async def publish(self, row, **result):
         """Only retry publication. An uncertain commit never causes model/tool replay."""
@@ -398,8 +475,15 @@ class Worker:
                 await asyncio.sleep(0.05 * (attempt + 1))
 
     async def execute(self, row):
+        from agent_service.code_execution import CodeExecutionScope
+
+        is_code = "code_analysis" in row["submitted_binding"]
         scope = (
-            ExecutionScope(self.db, row, self.resources.registry.execution)
+            CodeExecutionScope(
+                self.db, row, self.resources.registry.execution, self.resources.registry
+            )
+            if is_code
+            else ExecutionScope(self.db, row, self.resources.registry.execution)
             if row.get("_execution_reserved", False)
             else None
         )
@@ -419,6 +503,12 @@ class Worker:
             registry.mcp.cleanup_timeout if mcp_scope else 0
         )
         publication_reserve = registry.reliability.publication_reserve
+        if is_code:
+            cleanup_budget = max(
+                cleanup_budget,
+                self.resources.registry.code.settings.reserve_seconds
+                - publication_reserve,
+            )
         row["effective_deadline_at"] = row["deadline_at"] - timedelta(
             seconds=cleanup_budget + publication_reserve
         )
@@ -696,6 +786,13 @@ class Worker:
     async def tick(self):
         if not await self.maintain():
             return
+        from agent_service.code_execution import recover_code_resources
+
+        await recover_code_resources(self.db, self.resources.registry.execution)
+        now = asyncio.get_running_loop().time()
+        if now >= getattr(self, "_code_gc_at", 0):
+            await self.db.gc_code_content()
+            self._code_gc_at = now + self.settings.reconciliation_seconds
         await recover_resources(self.db, self.resources.registry.execution)
         from agent_service.background import monitor_operation
 
@@ -718,9 +815,17 @@ class Worker:
             self.tasks[row["id"]] = asyncio.create_task(self.execute(row))
 
     async def run(self):
+        if self.resources.registry.code.settings.enabled:
+            from agent_service.code_execution import preflight
+            from agent_service.execution import DockerClient
+
+            await preflight(DockerClient(), self.resources.registry.execution)
         if self.resources.registry.execution.image:
             try:
-                await check_environment(self.resources.registry.execution, checks=self.resources.registry.check_definitions())
+                await check_environment(
+                    self.resources.registry.execution,
+                    checks=self.resources.registry.check_definitions(),
+                )
             except EnvironmentUnavailable:
                 if self.resources.registry.check_definitions():
                     raise

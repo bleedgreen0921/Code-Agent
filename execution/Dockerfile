@@ -6,7 +6,7 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources && \
     rm -rf /var/lib/apt/lists/*
 COPY requirements.lock /opt/agent/requirements.lock
 RUN pip install --no-cache-dir -r /opt/agent/requirements.lock
-COPY execution/git_tools.py execution/helper.py execution/entrypoint.py execution/background.py /opt/agent/
+COPY execution/git_tools.py execution/helper.py execution/entrypoint.py execution/background.py execution/code_snapshot.py execution/project_runner.py /opt/agent/
 COPY execution/checks /opt/agent/checks
 RUN chmod 0555 /opt/agent/checks && chmod 0444 /opt/agent/checks/*.py
 LABEL io.agent-framework.checks="python-repair-v1"
@@ -14,3 +14,5 @@ LABEL io.agent-framework.helper="workspace-v2" io.agent-framework.background="ba
 ENV PATH="/usr/local/bin:/usr/bin:/bin" LANG="C.UTF-8" HOME="/tmp" TMPDIR="/tmp"
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/python", "-I", "/opt/agent/entrypoint.py"]
+
+LABEL io.agent-framework.code-analysis="code-analysis-v1"

@@ -230,10 +230,19 @@ def main():
         args = request["args"]
         if operation in ("read_file", "edit_file"):
             result = file_operation(operation, args, maximum)
+            if operation == "read_file" and request.get("evidence_mode"):
+                lines = result["content"].splitlines()
+                retained = []
+                for line in lines[:request.get("output_lines", 200)-12]:
+                    if len("\n".join([*retained, line]).encode()) > request.get("output_bytes", 16384)-1800:
+                        break
+                    retained.append(line)
+                result["content"] = "\n".join(retained)
+                result["truncated"] = result["truncated"] or len(retained)<len(lines)
         elif operation in ("git_status", "git_log", "git_diff", "git_read_file"):
             result = git_operation(ROOT, operation, args, maximum,
-                                   request.get("output_bytes", 16384),
-                                   request.get("output_lines", 200))
+                                   request.get("output_bytes", 16384) - (1800 if request.get("evidence_mode") else 0),
+                                   request.get("output_lines", 200) - (12 if request.get("evidence_mode") else 0))
         elif operation in ("glob_search", "grep_search"):
             result = search(operation, args, maximum)
         else:

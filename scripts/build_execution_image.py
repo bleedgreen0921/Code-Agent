@@ -10,9 +10,22 @@ TAG = "agent-execution:workspace-v2"
 def build(*, output=None):
     from agent_service.checks import asset_hashes, asset_fingerprint
 
+    from agent_service.code_registry import asset_digest
+
     subprocess.run(
-        ["docker", "build", "-f", "execution/Dockerfile", "-t", TAG,
-         "--label", "io.agent-framework.checks-assets=" + asset_fingerprint(asset_hashes()), "."],
+        [
+            "docker",
+            "build",
+            "-f",
+            "execution/Dockerfile",
+            "-t",
+            TAG,
+            "--label",
+            "io.agent-framework.checks-assets=" + asset_fingerprint(asset_hashes()),
+            "--label",
+            "io.agent-framework.code-assets=" + asset_digest(),
+            ".",
+        ],
         cwd=ROOT,
         check=True,
         stdout=output,

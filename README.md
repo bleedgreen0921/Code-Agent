@@ -1,8 +1,10 @@
 # Agent 执行框架
 
-本机运行的 Agent 执行服务，包含任务 API、异步 Worker 和 PostgreSQL 持久化。执行层使用 LangChain `create_agent`、原生消息状态、PostgreSQL Checkpointer 和摘要中间件。提供空工具聊天、容器内工作区搜索读取和文件修改/Shell 三种内置 Profile，并支持 Todo、Skills、受控只读委派、人工管理的项目知识、静态授权 MCP 工具，以及独立持久 Task 与后台操作。所有工作区工具在 Docker 中运行，直接修改注册目录。
+本机运行的 Agent 执行服务，包含任务 API、异步 Worker 和 PostgreSQL 持久化。执行层使用 LangChain `create_agent`、原生消息状态、PostgreSQL Checkpointer 和摘要中间件。提供空工具聊天、容器内工作区搜索读取和文件修改/Shell 三种内置 Profile，并支持 Todo、Skills、受控只读委派、人工管理的项目知识、静态授权 MCP 工具，以及独立持久 Task 与后台操作。所有工作区工具在 Docker 中运行；旧写入 Profile 直接修改注册目录，新增隔离分析入口只读取封存快照。
 
-基础增强阶段 1～6 及三批异常、可靠性与可信验证增强已实施，当前数据库版本为 `core_0008`。最新行为与验收见[第三批说明](docs/第三批可信验证与重复错误控制.md)和[独立验收记录](docs/第三批可信验证与重复错误控制验收.md)。测试使用合成模型，实际模型任务效果需单独评估；原阶段路线见[基础增强路线图](docs/基础架构增强路线图.md)。
+基础增强阶段 1～6 及三批异常、可靠性与可信验证增强已实施，当前数据库版本为 `core_0009`。最新行为与验收见[第三批说明](docs/第三批可信验证与重复错误控制.md)和[独立验收记录](docs/第三批可信验证与重复错误控制验收.md)。测试使用合成模型，实际模型任务效果需单独评估；原阶段路线见[基础增强路线图](docs/基础架构增强路线图.md)。
+
+新增可选的 `POST /v1/code/tasks`：固定工作区或本地提交快照，按需执行注册的 unittest/pytest，校验结构化证据并发布报告。见[使用说明](docs/可执行检查分析使用说明.md)及[验收记录](docs/可执行检查分析验收.md)。默认关闭，旧接口与固定验证器继续保留。
 
 ## 安装与初始化
 
@@ -18,7 +20,7 @@ export AGENT_DATABASE_URL='postgresql://agent_runtime:RUNTIME_PASSWORD@127.0.0.1
 .venv/bin/python -m db.doctor --json
 ```
 
-请预先创建空数据库。迁移 owner 需要创建表；bootstrap 还需要创建运行角色的权限。运行角色必须与 owner 分离，无 schema、数据库创建权或 revision 写权限。迁移通过单条 Alembic 链 `core_0001 → core_0002 → core_0003 → core_0004 → core_0005 → core_0006 → core_0007 → core_0008` 创建/升级核心表，版本权威为 `agent.alembic_version`，并调用框架 Checkpointer 和 PostgreSQL Store 的 `setup()`；重复执行安全，API/Worker 不执行 DDL。
+请预先创建空数据库。迁移 owner 需要创建表；bootstrap 还需要创建运行角色的权限。运行角色必须与 owner 分离，无 schema、数据库创建权或 revision 写权限。迁移通过单条 Alembic 链 `core_0001 → core_0002 → core_0003 → core_0004 → core_0005 → core_0006 → core_0007 → core_0008 → core_0009` 创建/升级核心表，版本权威为 `agent.alembic_version`，并调用框架 Checkpointer 和 PostgreSQL Store 的 `setup()`；重复执行安全，API/Worker 不执行 DDL。
 
 迁移接受空库、结构匹配的当前 `agent_core_0001` 核心库及已知 Alembic revision。旧核心库先经只读结构/标识校验，再登记 core_0001 并升级；历史会话与 Run 回填 chat 绑定，历史模型配置保持 null。旧业务 schema、未知 revision、未知非空库、结构不匹配库在任何 DDL 和权限修改前拒绝。checkpoint 表继续由框架维护。
 

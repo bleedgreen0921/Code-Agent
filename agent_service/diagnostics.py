@@ -93,6 +93,11 @@ class DiagnosticStore:
                        false,true,CASE WHEN e.state='cleanup_failed' THEN 'RESOURCE_CLEANUP_FAILED'
                                       ELSE 'RESOURCE_RELEASE_UNCONFIRMED' END
                 FROM agent.execution_resources e JOIN scoped r ON r.id=e.run_id WHERE e.state<>'released'
+                UNION ALL
+                SELECT 'code_execution_resource',e.id,e.run_id,r.task_id,e.state,NULL,e.created_at,
+                       false,true,CASE WHEN e.state='cleanup_failed' THEN 'RESOURCE_CLEANUP_FAILED'
+                                      ELSE 'RESOURCE_RELEASE_UNCONFIRMED' END
+                FROM agent.code_execution_resources e JOIN scoped r ON r.id=e.run_id WHERE e.state<>'released'
             ), counts AS (
                 SELECT count(*) FILTER(WHERE unknown_operation) AS unknown_operations,
                        count(*) FILTER(WHERE unreleased) AS unreleased_resources,

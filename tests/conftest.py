@@ -37,6 +37,19 @@ def database():
                     from agent_service.execution import DockerClient, LABEL
 
                     client = DockerClient()
+                    for resource in await resources.store.code_resources():
+                        item = await client.inspect(
+                            resource["container_id"] or resource["container_name"]
+                        )
+                        if item:
+                            assert (
+                                item["Config"]["Labels"].get(LABEL)
+                                == resource["container_name"]
+                            )
+                            assert item["Config"]["Labels"].get(
+                                "io.agent-framework.lease"
+                            ) == str(resource["lease_token"])
+                            await client.call("rm", "--force", item["Id"])
                     for op in await resources.store.operations(raw=True):
                         if op["backend"] != "docker":
                             continue

@@ -60,9 +60,18 @@ class TaskStore:
         return row
 
     async def create_task(
-        self, task, key=None, *, profile="chat", workspace_id=None, depends_on=()
+        self,
+        task,
+        key=None,
+        *,
+        profile="chat",
+        workspace_id=None,
+        depends_on=(),
+        _code=None,
     ):
         from agent_service.profiles import fingerprint
+
+        self.require_code_entry(profile, code_task=_code is not None)
 
         if key is not None and (not key.strip() or len(key) > 200):
             raise ApiError(422, ErrorCode.INVALID_REQUEST, "Invalid Idempotency-Key")
@@ -75,6 +84,7 @@ class TaskStore:
                 profile=profile,
                 workspace_id=workspace_id,
                 depends_on=list(map(str, dependencies)),
+                **({"code_request": _code["request"]} if _code else {}),
             )
         )
         async with self.locked() as conn:
@@ -94,6 +104,19 @@ class TaskStore:
                         )
                     return public_task(prior), True
             binding = self.binding(profile, workspace_id)
+            if _code:
+                contexts = await (
+                    await conn.execute(
+                        "SELECT t.task_id FROM agent.code_tasks t JOIN agent.tasks a ON a.id=t.task_id WHERE t.task_id=ANY(%s::uuid[]) AND a.workspace_id=%s AND a.submitted_binding->>'workspace_identity'=%s",
+                        (dependencies, workspace_id, binding["workspace_identity"]),
+                    )
+                ).fetchall()
+                if len(contexts) != len(dependencies):
+                    raise ApiError(
+                        422,
+                        ErrorCode.INVALID_REQUEST,
+                        "Context must be a code analysis task in the same workspace",
+                    )
             deps = await (
                 await conn.execute(
                     "SELECT id,status FROM agent.tasks WHERE id=ANY(%s::uuid[])",
@@ -140,6 +163,18 @@ class TaskStore:
                     ),
                 )
             ).fetchone()
+            if _code:
+                await conn.execute(
+                    """INSERT INTO agent.code_tasks(task_id,request,policy_fingerprint,check_suite_id,check_ids)
+                    VALUES(%s,%s,%s,%s,%s)""",
+                    (
+                        row["id"],
+                        Jsonb(_code["request"]),
+                        binding["fingerprint"],
+                        _code["suite"],
+                        Jsonb(list(_code["checks"])),
+                    ),
+                )
             for dep in dependencies:
                 await conn.execute(
                     "INSERT INTO agent.task_dependencies VALUES(%s,%s)",
@@ -271,8 +306,10 @@ class TaskStore:
             run_resources = await (
                 await conn.execute(
                     """SELECT e.state FROM agent.execution_resources e JOIN agent.runs r ON r.id=e.run_id
+                WHERE r.task_id=%s AND e.state<>'released'
+                UNION ALL SELECT e.state FROM agent.code_execution_resources e JOIN agent.runs r ON r.id=e.run_id
                 WHERE r.task_id=%s AND e.state<>'released' LIMIT 1""",
-                    (tid,),
+                    (tid, tid),
                 )
             ).fetchone()
             if task["status"] == "cancelling":
