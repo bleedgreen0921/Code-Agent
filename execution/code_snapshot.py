@@ -38,7 +38,7 @@ def safe_parts(value):
     return parts
 
 
-def read_regular(root, name, maximum):
+def read_regular(root, name, maximum, *, preserve_mode=False):
     parts = safe_parts(name)
     fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -60,7 +60,9 @@ def read_regular(root, name, maximum):
             data = stream.read(maximum + 1)
             if len(data) > maximum:
                 raise SnapshotError("File exceeds size limit", "SNAPSHOT_LIMIT")
-        return data, 0o755 if info.st_mode & 0o111 else 0o644
+        return data, stat.S_IMODE(info.st_mode) if preserve_mode else (
+            0o755 if info.st_mode & 0o111 else 0o644
+        )
     finally:
         os.close(fd)
 
@@ -165,7 +167,12 @@ def workspace_files(git, tracked, limits):
         if name.split("/")[0].lower() == ".git":
             raise SnapshotError("Invalid source path")
         try:
-            data, mode = read_regular(git.root, name, limits["file_bytes"])
+            data, mode = read_regular(
+                git.root,
+                name,
+                limits["file_bytes"],
+                preserve_mode=limits.get("preserve_modes", False),
+            )
         except FileNotFoundError:
             if name not in tracked:
                 raise SnapshotError(
@@ -192,7 +199,12 @@ def scan(root, limits):
         for name in files:
             path = Path(directory) / name
             relative = path.relative_to(root).as_posix()
-            data, mode = read_regular(root, relative, limits["snapshot_bytes"])
+            data, mode = read_regular(
+                root,
+                relative,
+                limits["snapshot_bytes"],
+                preserve_mode=limits.get("preserve_modes", False),
+            )
             total += len(data)
             if total > limits["snapshot_bytes"]:
                 raise SnapshotError(
@@ -267,7 +279,12 @@ def prepare(source, output, target, limits):
             else:
                 for path, info in initial.items():
                     if not info.get("deleted"):
-                        data, mode = read_regular(source, path, limits["file_bytes"])
+                        data, mode = read_regular(
+                            source,
+                            path,
+                            limits["file_bytes"],
+                            preserve_mode=limits.get("preserve_modes", False),
+                        )
                         if (
                             hashlib.sha256(data).hexdigest() != info["sha256"]
                             or mode != info["mode"]

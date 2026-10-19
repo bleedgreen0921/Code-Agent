@@ -6,41 +6,40 @@ import logging
 import signal
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import psycopg
+from langchain.agents.middleware import TodoListMiddleware
 from langchain_core.messages import HumanMessage
 
-from agent_service.reliability import remaining_execution, transient_database, backoff
-from agent_service.failure import failure_info, control_leaf, exception_code
-from agent_service.resources import Resources
-from agent_service.execution import ExecutionScope, recover_resources, check_environment
+from agent_service.context import inherited_state
+from agent_service.delegation import (
+    DelegationController,
+    DelegationDiagnostics,
+    InvalidFinalText,
+    ReportedUsage,
+    delegate_tool,
+    final_text,
+)
+from agent_service.execution import ExecutionScope, check_environment, recover_resources
+from agent_service.execution_adapter import WorkspaceExecutionMiddleware
 from agent_service.execution_config import WORKSPACE_TOOLS
 from agent_service.execution_errors import EnvironmentUnavailable
-from agent_service.execution_adapter import WorkspaceExecutionMiddleware
-from agent_service.workspace_tools import assemble
+from agent_service.failure import control_leaf, exception_code, failure_info
 from agent_service.profiles import ConfigurationChanged, Extension, tool_schema
-from agent_service.context import inherited_state
-from agent_service.skills import read_skill_tool
-from langchain.agents.middleware import TodoListMiddleware
-from agent_service.snapshot import runtime_snapshot
-from agent_service.verification import message_source_eligible
+from agent_service.reliability import backoff, remaining_execution, transient_database
+from agent_service.resources import Resources
 from agent_service.runtime import (
     RunContext,
     build_agent,
     model_from_resources,
     run_config,
 )
-
-from agent_service.delegation import (
-    DelegationController,
-    DelegationDiagnostics,
-    ReportedUsage,
-    delegate_tool,
-    final_text,
-    InvalidFinalText,
-)
+from agent_service.skills import read_skill_tool
+from agent_service.snapshot import runtime_snapshot
+from agent_service.verification import message_source_eligible
+from agent_service.workspace_tools import assemble
 
 log = logging.getLogger(__name__)
 
@@ -128,6 +127,7 @@ class Worker:
                 }
             )
         native_middleware = []
+        gate_middleware = []
         execution_middleware = []
         if set(profile.tools) & (WORKSPACE_TOOLS | {"start_background_shell"}):
             if scope is None:
@@ -146,13 +146,32 @@ class Worker:
                     actual_tools.update(
                         {tool.name: tool for tool in review_tools(scope)}
                     )
-            instances, native_middleware = assemble(scope, profile.tools)
-            actual_tools.update({tool.name: tool for tool in instances})
-            execution_middleware = [
-                WorkspaceExecutionMiddleware(
-                    scope, set(profile.tools) & WORKSPACE_TOOLS
+            repair = profile.id == "code-repair-isolated"
+            instances, native_middleware = assemble(
+                scope, tuple(n for n in profile.tools if not repair or n != "shell")
+            )
+            if repair:
+                from agent_service.repair_gate import (
+                    RepairExecutionMiddleware,
+                    RepairGateMiddleware,
                 )
-            ]
+                from agent_service.repair_tools import repair_shell, repair_tools
+
+                instances += [
+                    *repair_tools(scope),
+                    repair_shell(scope, registry.tools["shell"]),
+                ]
+                gate_middleware = [RepairGateMiddleware(scope)]
+            actual_tools.update({tool.name: tool for tool in instances})
+            execution_middleware = (
+                [RepairExecutionMiddleware(scope, profile.tools)]
+                if repair
+                else [
+                    WorkspaceExecutionMiddleware(
+                        scope, set(profile.tools) & WORKSPACE_TOOLS
+                    )
+                ]
+            )
         extension = registry.extensions.get(profile.id, Extension())
         if "write_todos" in profile.tools:
             native_middleware.append(TodoListMiddleware())
@@ -204,7 +223,7 @@ class Worker:
                 snapshot_id=str(row["_snapshot_id"]),
                 mount_identity=row["_code_scope"].manifest["content_digest"],
                 git_view_digest=row["_code_scope"].manifest["git_digest"],
-                read_only_workspace=True,
+                read_only_workspace=row["profile"] != "code-repair-isolated",
             )
             snapshot["run_timeout_seconds"] = min(
                 self.settings.run_timeout, registry.code_for(row).settings.run_seconds
@@ -262,6 +281,7 @@ class Worker:
             ),
             permission_policy=policy,
             execution_middleware=execution_middleware,
+            gate_middleware=gate_middleware,
             output_limits=(
                 registry.execution.output_bytes,
                 registry.execution.output_lines,
@@ -369,9 +389,32 @@ class Worker:
                                 code_scope.code.checks[c].manifest()
                                 for c in metadata["check_ids"]
                             ],
-                            "checks_notice": "No checks configured; report static analysis only."
-                            if not metadata["check_ids"]
-                            else "Only these registered checks are authorized.",
+                            "checks_notice": (
+                                "No development checks configured; independent acceptance remains required."
+                                if metadata["stage"] == "repair"
+                                and not metadata["check_ids"]
+                                else "No checks configured; report static analysis only."
+                                if not metadata["check_ids"]
+                                else "Only these registered development checks are authorized."
+                                if metadata["stage"] == "repair"
+                                else "Only these registered checks are authorized."
+                            ),
+                            **(
+                                {
+                                    "delivery_mode": "candidate_only",
+                                    "delivery_status": "not_applied",
+                                    "baseline_digest": code_scope.manifest[
+                                        "content_digest"
+                                    ],
+                                    "acceptance": code_scope.acceptance.manifest(),
+                                    "context_reports": code_scope.contexts,
+                                    "baseline_checks": list(code_scope.checks.values()),
+                                    "baseline_notice": "Use the actual baseline check record. Do not invent an initial failure when it passed.",
+                                    "historical_difference_notice": "Historical reports describe other snapshots. Only the present baseline identifies the repair target; re-read current code.",
+                                }
+                                if metadata["stage"] == "repair"
+                                else {}
+                            ),
                             "context_notice": "Dependency reports are external context, not verified source evidence for this snapshot.",
                         },
                         ensure_ascii=False,
@@ -410,7 +453,13 @@ class Worker:
             report = await scope.evidence.verify_persisted(state["structured_response"])
             from agent_service.code_reports import markdown_report
 
-            if row["_code"]["stage"] == "review":
+            if row["_code"]["stage"] == "repair":
+                from agent_service.repair_reports import markdown_repair
+
+                authority = scope.evidence.authority()
+                answer = markdown_repair(report, authority)
+                await self.db.bind_repair_checkpoint(row, final.config)
+            elif row["_code"]["stage"] == "review":
                 from agent_service.review_reports import markdown_review
 
                 authority = scope.evidence.authority(report)
@@ -477,6 +526,14 @@ class Worker:
                         ] and publication_matches(current, result)
                 return confirmed
             except CodeFailure as exc:
+                if row["profile"] == "code-repair-isolated":
+                    try:
+                        await self.db.retain_repair_failure(row, exc.code)
+                    except Exception:
+                        log.exception(
+                            "repair_diagnostic_retention_failed",
+                            extra={"run_id": row["id"]},
+                        )
                 # A rejected formal report rolls back completion. Publish only the
                 # failure on the same Run; never invoke the graph again.
                 result = {
@@ -507,12 +564,15 @@ class Worker:
 
     async def execute(self, row):
         from agent_service.code_execution import CodeExecutionScope
+        from agent_service.repair_execution import RepairExecutionScope
 
         is_code = "code_analysis" in row["submitted_binding"]
         scope = (
-            CodeExecutionScope(
-                self.db, row, self.resources.registry.execution, self.resources.registry
-            )
+            (
+                RepairExecutionScope
+                if row["profile"] == "code-repair-isolated"
+                else CodeExecutionScope
+            )(self.db, row, self.resources.registry.execution, self.resources.registry)
             if is_code
             else ExecutionScope(self.db, row, self.resources.registry.execution)
             if row.get("_execution_reserved", False)
@@ -679,6 +739,24 @@ class Worker:
                 clean = clean and mcp_clean and graph_stopped
                 if not clean and not result.get("error_code"):
                     result["error_code"] = "RESOURCE_CLEANUP_FAILED"
+                if row["profile"] == "code-repair-isolated" and (
+                    lost
+                    or cancelled
+                    or result.get("error_code")
+                    or not result.get("answer")
+                ):
+                    try:
+                        await self.db.retain_repair_failure(
+                            row,
+                            "CANCELLED"
+                            if cancelled
+                            else result.get("error_code") or "LEASE_EXPIRED",
+                        )
+                    except Exception:
+                        log.exception(
+                            "repair_diagnostic_retention_failed",
+                            extra={"run_id": row["id"]},
+                        )
                 if lost:
                     # Publish no result, but allow the existing DB expiry rules to
                     # close the Run when maintenance is available in this process.
@@ -849,6 +927,7 @@ class Worker:
         if (
             self.resources.registry.code.settings.enabled
             or self.resources.registry.review.settings.enabled
+            or self.resources.registry.repair.settings.enabled
         ):
             from agent_service.code_execution import preflight
             from agent_service.execution import DockerClient

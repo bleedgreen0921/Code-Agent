@@ -242,6 +242,7 @@ async def cancel_operation(
 
 from contracts.code import CodeTaskCreate
 from contracts.review import CodeReviewCreate
+from contracts.repair import CodeRepairCreate
 from typing import Annotated
 from pydantic import Discriminator, Tag
 
@@ -254,7 +255,8 @@ def code_stage(value):
 async def create_code_task(
     body: Annotated[
         Annotated[CodeTaskCreate, Tag("analysis")]
-        | Annotated[CodeReviewCreate, Tag("review")],
+        | Annotated[CodeReviewCreate, Tag("review")]
+        | Annotated[CodeRepairCreate, Tag("repair")],
         Discriminator(code_stage),
     ],
     request: Request,
@@ -296,10 +298,16 @@ async def code_artifact(task_id: UUID, artifact_id: UUID, request: Request):
     metadata, data = await db(request).code_artifact(task_id, artifact_id)
     media = (
         "text/markdown; charset=utf-8"
-        if metadata["kind"] in ("analysis_markdown", "review_markdown")
+        if metadata["kind"]
+        in ("analysis_markdown", "review_markdown", "repair_markdown")
+        else "application/zip"
+        if metadata["kind"] in ("repair_package", "repair_baseline")
         else "application/json"
         if metadata["kind"]
         in (
+            "repair_report",
+            "repair_manifest",
+            "repair_diagnostic",
             "analysis_report",
             "review_report",
             "source_evidence",
@@ -340,3 +348,18 @@ async def review_reproductions(
     cursor: UUID | None = None,
 ):
     return await db(request).code_page(task_id, "reproductions", limit, cursor)
+
+
+@router.get("/code/tasks/{task_id}/candidate")
+async def repair_candidate(task_id: UUID, request: Request):
+    return await db(request).repair_candidate(task_id)
+
+
+@router.get("/code/tasks/{task_id}/repair-attempts")
+async def repair_attempts(
+    task_id: UUID,
+    request: Request,
+    limit: int = Query(30, ge=1, le=100),
+    cursor: UUID | None = None,
+):
+    return await db(request).code_page(task_id, "repair_attempts", limit, cursor)

@@ -15,7 +15,7 @@ from contracts.review import ReviewReportV1
 VERSION = "code-analysis-v1"
 PROFILE = "code-analysis-isolated"
 REVIEW_PROFILE = "code-review-isolated"
-CODE_PROFILES = (PROFILE, REVIEW_PROFILE)
+CODE_PROFILES = (PROFILE, REVIEW_PROFILE, "code-repair-isolated")
 REVIEW_TOOLS = (
     "glob_search",
     "grep_search",
@@ -213,6 +213,14 @@ def assets():
             "git_tools.py",
             "helper.py",
             "entrypoint.py",
+            "repair_helper.py",
+            "acceptance_runner.py",
+            "acceptance_support.py",
+            "acceptance_app.py",
+            *(
+                p.relative_to(root).as_posix()
+                for p in sorted((root / "acceptance").rglob("*.py"))
+            ),
         )
     }
 

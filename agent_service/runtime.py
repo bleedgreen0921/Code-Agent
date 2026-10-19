@@ -76,6 +76,7 @@ def build_agent(
     response_format=None,
     permission_policy: PermissionPolicy | None = None,
     execution_middleware=(),
+    gate_middleware=(),
     output_limits=None,
     skills=(),
     model_call_limit=16,
@@ -121,6 +122,7 @@ def build_agent(
         response_format=response_format,
         middleware=[
             ToolLifecycleMiddleware(output_limits or (16384, 200), no_progress),
+            *gate_middleware,
             *([no_progress] if no_progress else []),
             ModelCallLimitMiddleware(run_limit=model_call_limit, exit_behavior="error"),
             ToolCallLimitMiddleware(run_limit=tool_call_limit, exit_behavior="error"),

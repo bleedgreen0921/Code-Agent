@@ -1,0 +1,37 @@
+version = 1
+
+[[workspaces]]
+id = "project"
+root = "/ABSOLUTE/PATH/TO/project"
+
+[execution]
+image = "sha256:REPLACE_WITH_64_HEX_DIGITS"
+
+# Default off. Register trusted definitions in server startup Python before enabling.
+# API, Worker and registered AcceptanceSuiteDefinition.image must use the same image.
+[code_repair]
+enabled = false
+storage_root = "/ABSOLUTE/PATH/TO/managed-code-storage"
+model_calls = 32
+tool_calls = 64
+check_calls = 12
+gate_rounds = 4
+run_seconds = 900
+reserve_seconds = 60
+check_seconds = 60
+round_seconds = 120
+storage_bytes = 4294967296
+
+[code_repair.acceptance_suites]
+project = ["sample-contract"]
+
+[code_repair.default_acceptance_suites]
+project = "sample-contract"
+
+# Development suites are optional and use registered ProjectCheckDefinition values.
+# [code_repair.check_suites]
+# development = ["unit"]
+# [code_repair.workspace_suites]
+# project = ["development"]
+# [code_repair.default_suites]
+# project = "development"

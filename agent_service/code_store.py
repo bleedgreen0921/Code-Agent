@@ -13,6 +13,8 @@ from agent_service.profiles import fingerprint
 from contracts.code import CodeTaskCreate
 from contracts.review import CodeReviewCreate
 from agent_service.review_store import ReviewStore
+from agent_service.repair_store import RepairStore
+from contracts.repair import CodeRepairCreate
 from contracts.errors import ApiError
 from contracts.v1 import ErrorCode
 
@@ -21,24 +23,39 @@ def public_artifact(row):
     return {k: v for k, v in row.items() if k != "storage_key"}
 
 
-class CodeStore(ReviewStore):
+class CodeStore(RepairStore, ReviewStore):
     @property
     def artifact_storage(self):
         return ArtifactStorage(
-            (
-                self.registry.code
-                if self.registry.code.settings.enabled
-                else self.registry.review
-            ).settings.storage_root
+            next(
+                (
+                    r.settings.storage_root
+                    for r in (
+                        self.registry.code,
+                        self.registry.review,
+                        self.registry.repair,
+                    )
+                    if r.settings.enabled
+                ),
+                None,
+            )
         )
 
     async def create_code_task(self, body, key=None):
         if not isinstance(body, CodeTaskCreate):
             body = (
-                CodeReviewCreate if body.get("stage") == "review" else CodeTaskCreate
+                CodeRepairCreate
+                if body.get("stage") == "repair"
+                else CodeReviewCreate
+                if body.get("stage") == "review"
+                else CodeTaskCreate
             ).model_validate(body)
         registry = (
-            self.registry.review if body.stage == "review" else self.registry.code
+            self.registry.repair
+            if body.stage == "repair"
+            else self.registry.review
+            if body.stage == "review"
+            else self.registry.code
         )
         if not registry.settings.enabled:
             raise ApiError(
@@ -46,6 +63,17 @@ class CodeStore(ReviewStore):
             )
         try:
             suite, checks = registry.select(body.workspace_id, body.check_suite_id)
+            if body.stage == "repair":
+                acceptance = registry.select_acceptance(
+                    body.workspace_id, body.acceptance_suite_id
+                )
+                registry.validate_budget(
+                    checks,
+                    acceptance=acceptance,
+                    run_seconds=min(
+                        self.settings.run_timeout, self.settings.task_timeout
+                    ),
+                )
         except ValueError as exc:
             raise ApiError(422, ErrorCode.INVALID_REQUEST, str(exc)) from exc
         return await self.create_task(
@@ -113,6 +141,17 @@ class CodeStore(ReviewStore):
                 except ApiError as exc:
                     if exc.status != 410:
                         raise
+        if row["stage"] == "repair":
+            detail = await self.repair_candidate(task_id)
+            summary.update(detail)
+            summary["candidate_revision_id"] = (
+                detail["candidate"]["current_revision_id"]
+                if detail["candidate"]
+                else None
+            )
+            summary["budget_usage"] = (
+                detail["candidate"]["usage"] if detail["candidate"] else {}
+            )
         return {
             **summary,
             "resolved_range": review["metadata"] if review else None,
@@ -132,6 +171,7 @@ class CodeStore(ReviewStore):
             else None,
             "report_artifact_id": row["report_artifact_id"],
             "markdown_artifact_id": row["markdown_artifact_id"],
+            "diagnostic_artifact_id": row["diagnostic_artifact_id"],
             "error_code": task["error_code"],
             "unresolved": task["unresolved"],
         }
@@ -171,6 +211,7 @@ class CodeStore(ReviewStore):
             "checks": "code_check_runs",
             "artifacts": "code_artifacts",
             "reproductions": "code_review_reproductions",
+            "repair_attempts": "code_repair_attempts",
         }[kind]
         async with self.pool.connection() as conn:
             rows = await (
@@ -496,21 +537,43 @@ class CodeStore(ReviewStore):
         }
         structured = await self.put_code_artifact(
             row,
-            "review_report"
+            "repair_report"
+            if row.get("_code", {}).get("stage") == "repair"
+            else "review_report"
             if row.get("_code", {}).get("stage") == "review"
             else "analysis_report",
             json.dumps(
-                {"report": report, "authority": authority},
+                {
+                    **(
+                        {
+                            "version": 1,
+                            "delivery_mode": "candidate_only",
+                            "delivery_status": "not_applied",
+                        }
+                        if row.get("_code", {}).get("stage") == "repair"
+                        else {}
+                    ),
+                    "report": report,
+                    "authority": authority,
+                },
                 ensure_ascii=False,
                 sort_keys=True,
             ).encode(),
             artifact_id=report_id,
             maximum=self.registry.code_for(row).settings.report_bytes
-            + (65536 if row.get("_code", {}).get("stage") == "review" else 32768),
+            + (
+                131072
+                if row.get("_code", {}).get("stage") == "repair"
+                else 65536
+                if row.get("_code", {}).get("stage") == "review"
+                else 32768
+            ),
         )
         rendered = await self.put_code_artifact(
             row,
-            "review_markdown"
+            "repair_markdown"
+            if row.get("_code", {}).get("stage") == "repair"
+            else "review_markdown"
             if row.get("_code", {}).get("stage") == "review"
             else "analysis_markdown",
             markdown.encode(),
@@ -520,6 +583,8 @@ class CodeStore(ReviewStore):
         return {"report": str(structured["id"]), "markdown": str(rendered["id"])}
 
     async def publish_code_report(self, conn, run, artifact_ids):
+        if run["profile"] == "code-repair-isolated":
+            return await self.publish_repair_report(conn, run, artifact_ids)
         if run["profile"] == "code-review-isolated":
             try:
                 return await self.publish_review_report(conn, run, artifact_ids)
@@ -645,15 +710,16 @@ class CodeStore(ReviewStore):
         """Serialize admission/GC and retain active dependency/resource references."""
         import shutil
 
-        settings = self.registry.code.settings
-        if not settings.enabled and not self.registry.review.settings.enabled:
+        enabled = [
+            r.settings
+            for r in (self.registry.code, self.registry.review, self.registry.repair)
+            if r.settings.enabled
+        ]
+        if not enabled:
             return
-        if self.registry.review.settings.enabled:
-            retention = max(
-                settings.retention_seconds if settings.enabled else 0,
-                self.registry.review.settings.retention_seconds,
-            )
-            settings = settings.model_copy(update={"retention_seconds": retention})
+        settings = enabled[0].model_copy(
+            update={"retention_seconds": max(s.retention_seconds for s in enabled)}
+        )
         async with self.locked() as conn:
             tasks = await (
                 await conn.execute(
@@ -688,6 +754,26 @@ class CodeStore(ReviewStore):
                         "UPDATE agent.code_artifacts SET state='deleted',deleted_at=clock_timestamp() WHERE id=%s",
                         (artifact["id"],),
                     )
+                revisions = await (
+                    await conn.execute(
+                        "SELECT storage_key FROM agent.code_repair_revisions WHERE task_id=%s",
+                        (task["id"],),
+                    )
+                ).fetchall()
+                candidates = await (
+                    await conn.execute(
+                        "SELECT storage_key FROM agent.code_repair_candidates WHERE task_id=%s AND status<>'deleted'",
+                        (task["id"],),
+                    )
+                ).fetchall()
+                for content in [*revisions, *candidates]:
+                    path = self.artifact_storage.path(content["storage_key"])
+                    if path.exists():
+                        shutil.rmtree(path)
+                await conn.execute(
+                    "UPDATE agent.code_repair_candidates SET status='deleted',deleted_at=clock_timestamp() WHERE task_id=%s",
+                    (task["id"],),
+                )
                 snapshots = await (
                     await conn.execute(
                         "SELECT * FROM agent.code_snapshots WHERE task_id=%s AND state<>'deleted' FOR UPDATE",
@@ -703,8 +789,18 @@ class CodeStore(ReviewStore):
                         (snapshot["id"],),
                     )
 
+            preparing = await (
+                await conn.execute("""SELECT
+                EXISTS(SELECT 1 FROM agent.code_tasks c JOIN agent.tasks t ON t.id=c.task_id
+                       WHERE t.status NOT IN ('completed','failed','cancelled')) OR
+                EXISTS(SELECT 1 FROM agent.code_execution_resources WHERE state<>'released') OR
+                EXISTS(SELECT 1 FROM agent.execution_resources WHERE state<>'released') AS active""")
+            ).fetchone()
+            if preparing["active"]:
+                return
             # Reclaim bounded, aged files left before metadata registration was
             # confirmed. Existing records (including active dependencies) win.
+            cutoff = datetime.now(timezone.utc).timestamp() - settings.retention_seconds
             directory = self.artifact_storage.path("artifacts/" + "0" * 32).parent
             if directory.exists():
                 cutoff = (
@@ -731,7 +827,44 @@ class CodeStore(ReviewStore):
                     if observed >= 100:
                         break
 
+            # Reclaim abandoned preparing directories without touching registered active content.
+            for family, table in (
+                ("candidates", "code_repair_candidates"),
+                ("revisions", "code_repair_revisions"),
+                ("snapshots", "code_snapshots"),
+            ):
+                directory = self.artifact_storage.path(family + "/" + "0" * 32).parent
+                if not directory.exists():
+                    continue
+                observed = 0
+                for path in directory.iterdir():
+                    if len(path.name) != 32 or any(
+                        c not in "0123456789abcdef" for c in path.name
+                    ):
+                        continue
+                    if path.is_symlink() or path.stat().st_mtime >= cutoff:
+                        continue
+                    registered = await (
+                        await conn.execute(
+                            sql.SQL(
+                                "SELECT 1 FROM agent.{} WHERE storage_key=%s"
+                            ).format(sql.Identifier(table)),
+                            (family + "/" + path.name,),
+                        )
+                    ).fetchone()
+                    if not registered:
+                        shutil.rmtree(path)
+                    observed += 1
+                    if observed >= 100:
+                        break
+
     async def reconcile_code_tasks(self, conn):
+        await conn.execute("""UPDATE agent.code_repair_candidates c SET status=t.status FROM agent.tasks t
+            WHERE c.task_id=t.id AND t.status IN ('failed','cancelled') AND c.status NOT IN ('deleted','failed','cancelled')""")
+        await conn.execute("""UPDATE agent.code_repair_attempts a SET status='inconclusive',
+            feedback='{"reason":"interrupted_execution","replayed":false}'::jsonb,finished_at=clock_timestamp()
+            FROM agent.runs r WHERE a.run_id=r.id AND a.status='running'
+            AND (r.status IN ('failed','cancelled','completed') OR r.lease_until<=clock_timestamp())""")
         await conn.execute("""UPDATE agent.code_snapshots s SET state='failed' FROM agent.runs r
             WHERE s.run_id=r.id AND s.state='preparing' AND r.status IN ('failed','cancelled')""")
         await conn.execute("""UPDATE agent.code_tasks c SET phase=t.status FROM agent.tasks t

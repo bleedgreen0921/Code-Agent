@@ -39,6 +39,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=55432)
     parser.add_argument("--keep-db", action="store_true")
+    parser.add_argument(
+        "--tests",
+        nargs="*",
+        default=[],
+        help="Optional focused test paths; default runs all tests",
+    )
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("Invalid port")
@@ -75,7 +81,8 @@ def main():
         LANGSMITH_TRACING="false",
         LANGCHAIN_TRACING_V2="false",
     )
-    env['AGENT_REVIEW_EXAMPLE_DIR'] = str(output / 'review-examples')
+    env["AGENT_REVIEW_EXAMPLE_DIR"] = str(output / "review-examples")
+    env["AGENT_REPAIR_EXAMPLE_DIR"] = str(output / "repair-examples")
     compose = [
         "docker",
         "compose",
@@ -113,7 +120,14 @@ def main():
         },
         "sources": {
             str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
-            for directory in ("agent_service", "contracts", "db", "execution", "scripts", "tests")
+            for directory in (
+                "agent_service",
+                "contracts",
+                "db",
+                "execution",
+                "scripts",
+                "tests",
+            )
             for p in sorted((ROOT / directory).rglob("*"))
             if p.is_file()
             and (p.suffix in (".py", ".sql", ".json") or p.name == "Dockerfile")
@@ -162,7 +176,7 @@ def main():
             text=True,
         ).strip()
         command([sys.executable, "-m", "db.migrate"])
-        metadata["checks"].append("core_0010 migration passed")
+        metadata["checks"].append("core_0011 migration passed")
         command([sys.executable, "-m", "db.bootstrap"])
         metadata["checks"].append("runtime bootstrap passed")
         command([sys.executable, "-m", "db.doctor", "--json"])
@@ -176,6 +190,7 @@ def main():
                 "-q",
                 "--junitxml",
                 str(report),
+                *args.tests,
             ],
             timeout=900,
         )

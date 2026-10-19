@@ -13,7 +13,7 @@ from psycopg.rows import dict_row
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
-VERSION = "core_0010"
+VERSION = "core_0011"
 STORE_TABLES = {"store", "store_migrations"}
 CORE_TABLES = {"schema_version", "conversations", "runs", "events", "workers"}
 CHECKPOINT_TABLES = {
@@ -26,9 +26,9 @@ ROOT = Path(__file__).parent
 
 
 CORE_QUERIES = {
-    "columns": "SELECT table_name,column_name,data_type,udt_name,is_nullable,column_default,is_identity\n            FROM information_schema.columns WHERE table_schema='agent'\n            AND table_name IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources','external_operations','tasks','task_dependencies','background_operations','task_events','code_tasks','code_snapshots','code_check_runs','code_execution_resources','code_artifacts','code_review_ranges','code_review_reproductions')\n            ORDER BY table_name,ordinal_position",
-    "constraints": "SELECT c.relname,con.conname,pg_get_constraintdef(con.oid)\n            FROM pg_constraint con JOIN pg_class c ON c.oid=con.conrelid\n            JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='agent'\n            AND c.relname IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources','external_operations','tasks','task_dependencies','background_operations','task_events','code_tasks','code_snapshots','code_check_runs','code_execution_resources','code_artifacts','code_review_ranges','code_review_reproductions')\n            ORDER BY 1,2",
-    "indexes": "SELECT tablename,indexname,indexdef FROM pg_indexes WHERE schemaname='agent'\n            AND tablename IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources','external_operations','tasks','task_dependencies','background_operations','task_events','code_tasks','code_snapshots','code_check_runs','code_execution_resources','code_artifacts','code_review_ranges','code_review_reproductions')\n            ORDER BY 1,2",
+    "columns": "SELECT table_name,column_name,data_type,udt_name,is_nullable,column_default,is_identity\n            FROM information_schema.columns WHERE table_schema='agent'\n            AND table_name IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources','external_operations','tasks','task_dependencies','background_operations','task_events','code_tasks','code_snapshots','code_check_runs','code_execution_resources','code_artifacts','code_review_ranges','code_review_reproductions','code_repair_candidates','code_repair_revisions','code_repair_attempts')\n            ORDER BY table_name,ordinal_position",
+    "constraints": "SELECT c.relname,con.conname,pg_get_constraintdef(con.oid)\n            FROM pg_constraint con JOIN pg_class c ON c.oid=con.conrelid\n            JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='agent'\n            AND c.relname IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources','external_operations','tasks','task_dependencies','background_operations','task_events','code_tasks','code_snapshots','code_check_runs','code_execution_resources','code_artifacts','code_review_ranges','code_review_reproductions','code_repair_candidates','code_repair_revisions','code_repair_attempts')\n            ORDER BY 1,2",
+    "indexes": "SELECT tablename,indexname,indexdef FROM pg_indexes WHERE schemaname='agent'\n            AND tablename IN ('schema_version','conversations','runs','events','workers','alembic_version','execution_resources','external_operations','tasks','task_dependencies','background_operations','task_events','code_tasks','code_snapshots','code_check_runs','code_execution_resources','code_artifacts','code_review_ranges','code_review_reproductions','code_repair_candidates','code_repair_revisions','code_repair_attempts')\n            ORDER BY 1,2",
 }
 
 
@@ -88,6 +88,9 @@ def validate_database(conn):
                 "code_artifacts",
                 "code_review_ranges",
                 "code_review_reproductions",
+                "code_repair_candidates",
+                "code_repair_revisions",
+                "code_repair_attempts",
             }
             and (t, k) not in (("events_id_seq", "S"), ("task_events_id_seq", "S"))
         )
@@ -120,6 +123,7 @@ def validate_database(conn):
             [("core_0008",)],
             [("core_0009",)],
             [("core_0010",)],
+            [("core_0011",)],
         ]:
             raise RuntimeError("Unknown revision rejected without modification")
         revision = revisions[0][0]

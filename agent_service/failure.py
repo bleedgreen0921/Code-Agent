@@ -165,7 +165,7 @@ _register(
     "Model authentication failed.",
 )
 _register(
-    "MODEL_RATE_LIMITED QUOTA_EXCEEDED BACKGROUND_CAPACITY_EXCEEDED",
+    "MODEL_RATE_LIMITED QUOTA_EXCEEDED BACKGROUND_CAPACITY_EXCEEDED REPAIR_BUDGET_EXHAUSTED",
     "quota",
     "not_applicable",
     "stop",
@@ -264,7 +264,7 @@ _register(
     "Source snapshot could not be safely sealed or verified.",
 )
 _register(
-    "ARTIFACT_INVALID ARTIFACT_LIMIT REPORT_INVALID",
+    "ARTIFACT_INVALID ARTIFACT_LIMIT REPORT_INVALID ACCEPTANCE_INVALID",
     "verification",
     "not_applicable",
     "stop",

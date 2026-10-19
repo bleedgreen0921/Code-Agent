@@ -24,7 +24,7 @@ class ArtifactStorage:
         parts = key.split("/")
         if (
             len(parts) != 2
-            or parts[0] not in ("artifacts", "snapshots")
+            or parts[0] not in ("artifacts", "snapshots", "candidates", "revisions")
             or len(parts[1]) != 32
         ):
             raise CodeFailure("ARTIFACT_INVALID", "Invalid managed storage key")

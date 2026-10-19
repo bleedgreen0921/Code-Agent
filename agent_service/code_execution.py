@@ -105,7 +105,7 @@ class CodeExecutionScope(ReviewExecution, ExecutionScope):
         self.children.append(scope)
         return scope
 
-    async def prepare(self):
+    async def prepare_snapshot(self):
         if not self.row.get("task_id"):
             raise CodeFailure(
                 "CODE_TASK_REQUIRED", "Code profile requires a dedicated task"
@@ -191,10 +191,17 @@ class CodeExecutionScope(ReviewExecution, ExecutionScope):
         await self.store.seal_code_snapshot(
             self.row, self.manifest, self.snapshot_root, hashlib.sha256(raw).hexdigest()
         )
+
+    async def prepare(self):
+        await self.prepare_snapshot()
+        metadata = self.row["_code"]
+        sid = self.row["_snapshot_id"]
         if metadata["stage"] == "review":
             from agent_service.review_reports import ReviewLedger
 
-            document = json.loads((directory / "changes.json").read_bytes())
+            document = json.loads(
+                (self.snapshot_root.parent / "changes.json").read_bytes()
+            )
             if document["range"] != self.manifest["review"]:
                 raise CodeFailure(
                     "SNAPSHOT_INVALID", "Prepared range metadata mismatch"
@@ -457,4 +464,19 @@ async def recover_code_resources(store, settings):
             WHERE c.run_id=r.id AND c.status='running' AND
             (r.status IN ('failed','cancelled','completed') OR r.lease_until<=clock_timestamp())""",
             (Jsonb(observed), fingerprint(observed)),
+        )
+
+    async with store.pool.connection() as conn:
+        interrupted_repairs = await (
+            await conn.execute("""SELECT r.* FROM agent.runs r
+            JOIN agent.code_tasks c ON c.task_id=r.task_id
+            WHERE c.stage='repair' AND c.diagnostic_artifact_id IS NULL AND r.lease_token IS NOT NULL
+            AND r.status IN ('failed','cancelled') LIMIT 20""")
+        ).fetchall()
+    for row in interrupted_repairs:
+        await store.retain_repair_failure(
+            row,
+            "CANCELLED"
+            if row["status"] == "cancelled"
+            else row["error_code"] or "WORKER_STOPPED",
         )

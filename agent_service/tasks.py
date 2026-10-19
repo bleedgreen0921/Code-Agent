@@ -107,7 +107,7 @@ class TaskStore:
             if _code:
                 contexts = await (
                     await conn.execute(
-                        "SELECT t.task_id FROM agent.code_tasks t JOIN agent.tasks a ON a.id=t.task_id WHERE t.task_id=ANY(%s::uuid[]) AND a.workspace_id=%s AND a.submitted_binding->>'workspace_identity'=%s",
+                        "SELECT t.task_id FROM agent.code_tasks t JOIN agent.tasks a ON a.id=t.task_id WHERE t.stage IN ('analysis','review') AND t.task_id=ANY(%s::uuid[]) AND a.workspace_id=%s AND a.submitted_binding->>'workspace_identity'=%s",
                         (dependencies, workspace_id, binding["workspace_identity"]),
                     )
                 ).fetchall()

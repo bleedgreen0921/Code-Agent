@@ -40,7 +40,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
             revisions = await (
                 await conn.execute("SELECT version_num FROM agent.alembic_version")
             ).fetchall()
-            if revisions != [{"version_num": "core_0010"}]:
+            if revisions != [{"version_num": "core_0011"}]:
                 raise RuntimeError("Core database baseline required")
             await conn.execute("SELECT 1 FROM agent.checkpoints LIMIT 1")
             await conn.execute("SELECT 1 FROM agent.store LIMIT 1")
@@ -56,7 +56,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
                     signature[key] = [list(r.values()) for r in rows]
             if (
                 signature
-                != json.loads((ROOT / "structure.json").read_text())["core_0010"]
+                != json.loads((ROOT / "structure.json").read_text())["core_0011"]
             ):
                 raise RuntimeError("Core structure mismatch")
             from langgraph.store.postgres import PostgresStore
@@ -93,14 +93,13 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
                 raise RuntimeError(
                     "A separate runtime role without migration permissions is required"
                 )
-        if self.registry.code.settings.enabled or self.registry.review.settings.enabled:
-            root = Path(
-                (
-                    self.registry.code
-                    if self.registry.code.settings.enabled
-                    else self.registry.review
-                ).settings.storage_root
-            )
+        enabled_code = [
+            r
+            for r in (self.registry.code, self.registry.review, self.registry.repair)
+            if r.settings.enabled
+        ]
+        if enabled_code:
+            root = Path(enabled_code[0].settings.storage_root)
             import os
 
             if (
@@ -535,6 +534,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
                         in (
                             self.registry.code.settings.profile,
                             self.registry.review.settings.profile,
+                            self.registry.repair.settings.profile,
                         )
                         else self.settings.run_timeout,
                         self.settings.lease_seconds,
@@ -807,6 +807,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
                 in (
                     self.registry.code.settings.profile,
                     self.registry.review.settings.profile,
+                    self.registry.repair.settings.profile,
                 )
             ):
                 if not code_artifacts:

@@ -6,7 +6,8 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources && \
     rm -rf /var/lib/apt/lists/*
 COPY requirements.lock /opt/agent/requirements.lock
 RUN pip install --no-cache-dir -r /opt/agent/requirements.lock
-COPY execution/git_tools.py execution/helper.py execution/entrypoint.py execution/background.py execution/code_snapshot.py execution/project_runner.py execution/code_review.py execution/review_runner.py /opt/agent/
+COPY execution/git_tools.py execution/helper.py execution/entrypoint.py execution/background.py execution/code_snapshot.py execution/project_runner.py execution/code_review.py execution/review_runner.py execution/repair_helper.py execution/acceptance_runner.py execution/acceptance_support.py execution/acceptance_app.py /opt/agent/
+COPY execution/acceptance /opt/agent/acceptance
 COPY execution/checks /opt/agent/checks
 RUN chmod 0555 /opt/agent/checks && chmod 0444 /opt/agent/checks/*.py
 LABEL io.agent-framework.checks="python-repair-v1"
