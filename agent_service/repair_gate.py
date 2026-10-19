@@ -107,9 +107,14 @@ class RepairGateMiddleware(AgentMiddleware):
 
     def usage(self, state):
         scope = self.scope
+        persistent = scope.delivery.persistent_usage if scope.delivery else {}
         return dict(
-            model_calls=state.get("run_model_call_count", 0),
-            tool_calls=state.get("run_tool_call_count", {}).get("__all__", 0),
+            model_calls=persistent.get(
+                "model_calls", state.get("run_model_call_count", 0)
+            ),
+            tool_calls=persistent.get(
+                "tool_calls", state.get("run_tool_call_count", {}).get("__all__", 0)
+            ),
             check_calls=len(scope.checks),
             gate_rounds=scope.rounds,
             admitted_bytes=scope.candidate["admitted_bytes"],
@@ -234,7 +239,13 @@ class RepairGateMiddleware(AgentMiddleware):
                     c["result"]["status"] == "passed" and c["result"]["complete"]
                     for c in checks
                 )
-                if not passed:
+                if passed and scope.delivery:
+                    passed, merged_checks, failure = await scope.delivery.validate(
+                        revision, checks
+                    )
+                    if not passed:
+                        checks = checks + merged_checks
+                if not passed and failure is None:
                     failure = (
                         "Required checks failed or could not confirm the candidate."
                     )

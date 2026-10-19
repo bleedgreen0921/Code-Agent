@@ -26,6 +26,7 @@ from agent_service.execution import ExecutionScope, check_environment, recover_r
 from agent_service.execution_adapter import WorkspaceExecutionMiddleware
 from agent_service.execution_config import WORKSPACE_TOOLS
 from agent_service.execution_errors import EnvironmentUnavailable
+from agent_service.code_artifacts import CodeFailure
 from agent_service.failure import control_leaf, exception_code, failure_info
 from agent_service.profiles import ConfigurationChanged, Extension, tool_schema
 from agent_service.reliability import backoff, remaining_execution, transient_database
@@ -162,6 +163,16 @@ class Worker:
                     repair_shell(scope, registry.tools["shell"]),
                 ]
                 gate_middleware = [RepairGateMiddleware(scope)]
+                if scope.delivery:
+                    from agent_service.delivery_pipeline import (
+                        PersistentDeliveryBudget,
+                        DeliveryHandoffMiddleware,
+                    )
+
+                    gate_middleware += [
+                        PersistentDeliveryBudget(scope),
+                        DeliveryHandoffMiddleware(scope),
+                    ]
             actual_tools.update({tool.name: tool for tool in instances})
             execution_middleware = (
                 [RepairExecutionMiddleware(scope, profile.tools)]
@@ -401,7 +412,9 @@ class Worker:
                             ),
                             **(
                                 {
-                                    "delivery_mode": "candidate_only",
+                                    "delivery_mode": metadata["request"][
+                                        "delivery_mode"
+                                    ],
                                     "delivery_status": "not_applied",
                                     "baseline_digest": code_scope.manifest[
                                         "content_digest"
@@ -437,7 +450,67 @@ class Worker:
             context=context,
             durability="sync",
         )
-        if scope:
+        if scope and getattr(scope, "delivery", None):
+            from agent_service.delivery_apply import DeliveryController
+            from agent_service.delivery_evidence import (
+                validate_delivery,
+                validate_handoff,
+            )
+            from langgraph.types import Command
+
+            while state.get("__interrupt__"):
+                paused = await graph.aget_state(config)
+                payload = state["__interrupt__"][-1]
+                if payload.value.get("kind") != "delivery-handoff-v1":
+                    raise IncompleteGraphError("Unexpected internal interruption")
+                await scope.quiescent()
+                await scope.healthy()
+                if not await scope.close():
+                    raise CodeFailure(
+                        "RESOURCE_CLEANUP_FAILED", "Delivery cleanup is unconfirmed"
+                    )
+                await self.db.bind_delivery_handoff(row, paused.config)
+                row["workspace_root"] = str(scope.delivery.root)
+
+                async def verify_delivery(d):
+                    await validate_handoff(graph, d)
+                    return await validate_delivery(self.db, d)
+
+                controller = DeliveryController(
+                    self.db,
+                    row,
+                    scope.delivery.private,
+                    scope.code.settings.model_dump(),
+                    verify_delivery,
+                )
+                outcome = await controller.run()
+                action = (
+                    "refresh"
+                    if outcome.get("refresh_required")
+                    else "applied"
+                    if outcome["status"] == "applied"
+                    else None
+                )
+                if action is None:
+                    raise CodeFailure(
+                        "DELIVERY_NEEDS_RECOVERY"
+                        if outcome["status"] == "needs_recovery"
+                        else "DELIVERY_STOPPED",
+                        "Automatic delivery stopped; inspect delivery facts",
+                    )
+                resume = dict(
+                    delivery_id=payload.value["delivery_id"],
+                    plan_id=payload.value["plan_id"],
+                    action=action,
+                )
+                row["_internal_delivery_resume"] = resume
+                state = await graph.ainvoke(
+                    Command(resume={payload.id: resume}),
+                    config,
+                    context=context,
+                    durability="sync",
+                )
+        if scope and not row.get("_delivery_applied"):
             await scope.healthy()
         final = await graph.aget_state(
             {**config, "configurable": {**config["configurable"], "checkpoint_ns": ""}}
@@ -457,6 +530,18 @@ class Worker:
                 from agent_service.repair_reports import markdown_repair
 
                 authority = scope.evidence.authority()
+                if scope.delivery:
+                    from agent_service.delivery_evidence import delivery_summary
+
+                    delivery = await self.db.delivery_for_run(row["id"])
+                    authority.update(
+                        delivery_mode="auto_apply",
+                        delivery_status="applied",
+                        delivery=await delivery_summary(self.db, delivery),
+                    )
+                    await self.db.update_delivery(
+                        row, final_checkpoint=final.config, phase="publishing"
+                    )
                 answer = markdown_repair(report, authority)
                 await self.db.bind_repair_checkpoint(row, final.config)
             elif row["_code"]["stage"] == "review":
@@ -492,6 +577,15 @@ class Worker:
 
         answer, checkpoint = await self.generate(row, scope)
         row["_agent_closed"] = True
+        if getattr(scope, "delivery", None):
+            await self.db.update_delivery(
+                row,
+                publication={
+                    "answer": answer,
+                    "checkpoint": checkpoint,
+                    "code_artifacts": row["_code_artifacts"],
+                },
+            )
         row["_candidate_answer"], row["_candidate_checkpoint"] = answer, checkpoint
         context = row.get("_verification_context")
         report, error = await verify(
@@ -504,6 +598,20 @@ class Worker:
 
     async def publish(self, row, **result):
         """Only retry publication. An uncertain commit never causes model/tool replay."""
+        delivery = (
+            await self.db.delivery_for_run(row["id"])
+            if row.get("profile") == "code-repair-isolated"
+            else None
+        )
+        if (
+            delivery
+            and delivery["checkpoint"]
+            and delivery["status"] in ("pending", "applying", "applied")
+            and (result.get("error_code") or not result.get("answer"))
+        ):
+            # Delivery transport failures are reconciled from the journal; do not
+            # turn an interrupted original Run into an ineligible new execution.
+            return False
         if result.get("error_code") and "failure_info" not in result:
             result["failure_info"] = failure_info(result["error_code"])
         from agent_service.code_artifacts import CodeFailure
@@ -526,6 +634,13 @@ class Worker:
                         ] and publication_matches(current, result)
                 return confirmed
             except CodeFailure as exc:
+                delivery = await self.db.delivery_for_run(row["id"])
+                if delivery and delivery["status"] == "applied":
+                    log.exception(
+                        "applied_delivery_publication_unconfirmed",
+                        extra={"run_id": str(row["id"])},
+                    )
+                    return False
                 if row["profile"] == "code-repair-isolated":
                     try:
                         await self.db.retain_repair_failure(row, exc.code)
@@ -600,6 +715,16 @@ class Worker:
                 self.resources.registry.code_for(row).settings.reserve_seconds
                 - publication_reserve,
             )
+        auto_apply = False
+        if is_code and row["profile"] == "code-repair-isolated":
+            code_metadata = await self.db.code_metadata(row["task_id"])
+            auto_apply = code_metadata["request"]["delivery_mode"] == "auto_apply"
+            if auto_apply:
+                cleanup_budget = max(
+                    cleanup_budget,
+                    registry.repair.settings.delivery_reserve_seconds
+                    - publication_reserve,
+                )
         row["effective_deadline_at"] = row["deadline_at"] - timedelta(
             seconds=cleanup_budget + publication_reserve
         )
@@ -658,7 +783,13 @@ class Worker:
                     min(
                         float(row["remaining"]),
                         (
-                            row["effective_deadline_at"] - datetime.now(timezone.utc)
+                            (
+                                row["deadline_at"]
+                                - timedelta(seconds=publication_reserve)
+                                if auto_apply
+                                else row["effective_deadline_at"]
+                            )
+                            - datetime.now(timezone.utc)
                         ).total_seconds(),
                     ),
                 ),
@@ -898,6 +1029,9 @@ class Worker:
         from agent_service.code_execution import recover_code_resources
 
         await recover_code_resources(self.db, self.resources.registry.execution)
+        from agent_service.delivery_recovery import recover_deliveries
+
+        await recover_deliveries(self.resources)
         now = asyncio.get_running_loop().time()
         if now >= getattr(self, "_code_gc_at", 0):
             await self.db.gc_code_content()

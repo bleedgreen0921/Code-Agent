@@ -35,3 +35,11 @@ project = "sample-contract"
 # project = ["development"]
 # [code_repair.default_suites]
 # project = "development"
+
+# Explicit auto_apply requests also require this separate workspace allowlist.
+# Remains empty by default. Create the private directory on the same local Linux
+# filesystem as the workspace, outside every registered workspace, owned by the
+# service account with mode 0700. Never mount it into execution containers.
+# [code_repair.auto_apply_workspaces]
+# project = "/ABSOLUTE/PATH/TO/private-delivery-storage"
+# Automatic mode reserves 120 seconds; one writeback has an immutable 60s deadline.

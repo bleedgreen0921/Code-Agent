@@ -36,9 +36,19 @@ class RepairStore:
                     (candidate["id"] if candidate else None,),
                 )
             ).fetchall()
+        delivery = (
+            await self.delivery_for_run(candidate["run_id"]) if candidate else None
+        )
         return dict(
-            delivery_mode="candidate_only",
-            delivery_status="not_applied",
+            delivery_mode=metadata["request"]["delivery_mode"],
+            delivery_status=delivery["status"]
+            if delivery
+            else (
+                "pending"
+                if metadata["request"]["delivery_mode"] == "auto_apply"
+                else "not_applied"
+            ),
+            delivery_impact=delivery["impact"] if delivery else "none",
             candidate={k: v for k, v in candidate.items() if k != "storage_key"}
             if candidate
             else None,
@@ -122,7 +132,7 @@ class RepairStore:
             )
         return result
 
-    async def save_repair_revision(self, row, revision):
+    async def save_repair_revision(self, row, revision, update_current=True):
         async with self.locked() as conn:
             await self.code_live(conn, row)
             prior = await (
@@ -143,10 +153,17 @@ class RepairStore:
                     (revision["candidate_id"], row["id"]),
                 )
             ).fetchone()
-            if not candidate or candidate["status"] not in ("preparing", "writable"):
+            if not candidate or candidate["status"] not in (
+                ("preparing", "writable")
+                if update_current
+                else ("preparing", "writable", "passed")
+            ):
                 raise CodeFailure("PERMISSION_DENIED", "Candidate writes are closed")
+            delivery = await self.delivery_for_run(row["id"], conn)
             if (
-                candidate["admitted_bytes"] + revision["size_bytes"]
+                candidate["admitted_bytes"]
+                + revision["size_bytes"]
+                + (delivery["admitted_bytes"] if delivery else 0)
                 > self.registry.repair.settings.storage_bytes
             ):
                 raise CodeFailure(
@@ -166,11 +183,16 @@ class RepairStore:
                     tuple(revision.values()),
                 )
             ).fetchone()
-            await conn.execute(
-                """UPDATE agent.code_repair_candidates SET current_revision_id=%s,
-                status='writable',admitted_bytes=admitted_bytes+%s WHERE id=%s""",
-                (revision["id"], revision["size_bytes"], candidate["id"]),
-            )
+            if update_current:
+                await conn.execute(
+                    "UPDATE agent.code_repair_candidates SET current_revision_id=%s,status='writable',admitted_bytes=admitted_bytes+%s WHERE id=%s",
+                    (revision["id"], revision["size_bytes"], candidate["id"]),
+                )
+            else:
+                await conn.execute(
+                    "UPDATE agent.code_repair_candidates SET admitted_bytes=admitted_bytes+%s WHERE id=%s",
+                    (revision["size_bytes"], candidate["id"]),
+                )
             return saved
 
     async def reserve_repair_attempt(self, row, candidate_id, message_id, draft):
@@ -385,7 +407,7 @@ class RepairStore:
                 (artifact["id"], row["task_id"]),
             )
             await conn.execute(
-                "UPDATE agent.code_repair_candidates SET status=CASE WHEN %s='CANCELLED' THEN 'cancelled' ELSE 'failed' END WHERE run_id=%s AND status<>'published'",
+                "UPDATE agent.code_repair_candidates SET status=CASE WHEN %s='CANCELLED' THEN 'cancelled' ELSE 'failed' END WHERE run_id=%s AND status<>'published' AND NOT EXISTS(SELECT 1 FROM agent.code_deliveries d WHERE d.run_id=agent.code_repair_candidates.run_id AND d.status='applied')",
                 (reason, row["id"]),
             )
 
@@ -440,6 +462,37 @@ class RepairStore:
                 "REPORT_INVALID", "Formal repair artifact identities differ"
             )
         await validate_published(self, conn, run, candidate, document)
+        if document.get("delivery_mode") == "auto_apply":
+            from agent_service.delivery_evidence import (
+                validate_delivery,
+                delivery_summary,
+            )
+
+            delivery = await self.delivery_for_run(run["id"], conn)
+            if (
+                not delivery
+                or delivery["final_checkpoint"] != candidate["final_checkpoint"]
+            ):
+                raise CodeFailure(
+                    "DELIVERY_EVIDENCE_INVALID", "Final delivery checkpoint differs"
+                )
+            await validate_delivery(self, delivery, conn, require_applied=True)
+            if (
+                document["delivery"] != await delivery_summary(self, delivery, conn)
+                or document["authority"]["delivery"] != document["delivery"]
+            ):
+                raise CodeFailure(
+                    "DELIVERY_EVIDENCE_INVALID",
+                    "Delivery report differs from actual journal",
+                )
+            await conn.execute(
+                "UPDATE agent.code_deliveries SET phase='published' WHERE id=%s",
+                (delivery["id"],),
+            )
+            await conn.execute(
+                "UPDATE agent.code_workspace_occupancy SET released_at=clock_timestamp() WHERE delivery_id=%s",
+                (delivery["id"],),
+            )
         if markdown_repair(document["report"], document["authority"]).encode() != read(
             by_id[artifact_ids["markdown"]]
         ):

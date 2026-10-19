@@ -17,7 +17,7 @@ from agent_service.repair_versions import (
     verify_package,
     verify_revision,
 )
-from contracts.repair import RepairDraftV1, RepairReportV1
+from contracts.repair import DeliveryReportV1, RepairDraftV1, RepairReportV1
 
 
 class RepairLedger(EvidenceLedger):
@@ -165,7 +165,9 @@ def markdown_repair(report, authority):
         "",
         report["summary"],
         "",
-        "交付状态：candidate_only / not_applied（尚未写回原目录）",
+        "交付状态：auto_apply / applied"
+        if authority["delivery_mode"] == "auto_apply"
+        else "交付状态：candidate_only / not_applied（尚未写回原目录）",
         "基线：" + authority["baseline_digest"],
         "冻结候选：" + authority["content_digest"],
         "",
@@ -205,13 +207,24 @@ def markdown_repair(report, authority):
         "预算：" + json.dumps(authority["usage"], sort_keys=True),
         "",
     ]
+    if authority["delivery_mode"] == "auto_apply":
+        delivery = authority["delivery"]
+        lines += [
+            "最终交付版本 M：" + delivery["final_digest"],
+            "源码引用对应候选 A；M 的检查和 U→M 写回清单单独记录。",
+            "交付记录：" + json.dumps(delivery, ensure_ascii=False, sort_keys=True),
+        ]
     return "\n".join(lines)
 
 
 async def validate_published(store, conn, run, candidate, document):
     """Reconcile persisted identities/bytes, never rerun acceptance during publication."""
     try:
-        validated = RepairReportV1.model_validate(document)
+        validated = (
+            DeliveryReportV1
+            if document.get("delivery_mode") == "auto_apply"
+            else RepairReportV1
+        ).model_validate(document)
         draft = validated.report.model_dump(mode="json")
         authority = document["authority"]
         attempt = await (
@@ -244,8 +257,8 @@ async def validate_published(store, conn, run, candidate, document):
             or authority["run_id"] != str(run["id"])
             or authority["task_id"] != str(run["task_id"])
             or authority["snapshot_id"] != str(candidate["baseline_id"])
-            or authority["delivery_status"] != "not_applied"
-            or authority["delivery_mode"] != "candidate_only"
+            or (authority["delivery_status"], authority["delivery_mode"])
+            != (validated.delivery_status, validated.delivery_mode)
             or draft["unfinished"]
             or any(g["status"] != "resolved" for g in draft["goals"])
         ):

@@ -301,13 +301,22 @@ async def code_artifact(task_id: UUID, artifact_id: UUID, request: Request):
         if metadata["kind"]
         in ("analysis_markdown", "review_markdown", "repair_markdown")
         else "application/zip"
-        if metadata["kind"] in ("repair_package", "repair_baseline")
+        if metadata["kind"]
+        in (
+            "repair_package",
+            "repair_baseline",
+            "delivery_package",
+            "integration_package",
+        )
         else "application/json"
         if metadata["kind"]
         in (
             "repair_report",
             "repair_manifest",
             "repair_diagnostic",
+            "delivery_manifest",
+            "integration_manifest",
+            "delivery_candidate_proof",
             "analysis_report",
             "review_report",
             "source_evidence",
@@ -363,3 +372,18 @@ async def repair_attempts(
     cursor: UUID | None = None,
 ):
     return await db(request).code_page(task_id, "repair_attempts", limit, cursor)
+
+
+@router.get("/code/tasks/{task_id}/delivery")
+async def code_delivery(task_id: UUID, request: Request):
+    return await db(request).delivery_detail(task_id)
+
+
+@router.get("/code/tasks/{task_id}/delivery/events")
+async def code_delivery_events(
+    task_id: UUID,
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=100),
+    cursor: UUID | None = None,
+):
+    return await db(request).delivery_events(task_id, limit, cursor)

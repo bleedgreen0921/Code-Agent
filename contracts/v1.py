@@ -40,7 +40,7 @@ class ConversationCreate(BindingFields):
 
 
 RunStatus = Literal[
-    "queued", "running", "cancelling", "completed", "failed", "cancelled"
+    "queued", "running", "delivering", "cancelling", "completed", "failed", "cancelled"
 ]
 
 
@@ -59,6 +59,7 @@ TaskStatus = Literal[
     "waiting_dependencies",
     "queued",
     "running",
+    "delivering",
     "waiting_background",
     "cancelling",
     "completed",

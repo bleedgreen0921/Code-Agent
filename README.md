@@ -244,3 +244,7 @@ Git Review 阶段二支持当前未提交改动和指定历史提交，部署、
 阶段二固定范围 Review 已提供独立请求、Profile、原始 index/commit 副本、两侧固定差异证据、head 临时 Python 复现与 `ReviewReportV1` 校验。配置默认关闭；部署、范围语义、预算、产物和人工验收说明见 [docs/code-review.md](docs/code-review.md)，配置示例见 [config/runtime.code.review.example.toml](config/runtime.code.review.example.toml)。数据库需升级到 `core_0010` 并重新构建固定执行镜像；新旧 Worker 不可混跑 Review。
 
 阶段三隔离修复使用默认关闭的 `code_repair` 和显式 `candidate_only` 请求。它在独立可写候选中修复，通过注册独立验收后输出冻结版本、完整修改清单、ZIP 文件包、B→候选补丁和报告，交付状态始终为 `not_applied`。图内失败反馈沿用同一个 Run 和候选，不写回原目录。部署、可信套件注册、预算和恢复见 [docs/code-repair.md](docs/code-repair.md)，配置见 [config/runtime.code.repair.example.toml](config/runtime.code.repair.example.toml)。数据库需升级到 `core_0011` 并重建执行镜像。
+
+## 阶段四自动交付（默认关闭）
+
+显式 `auto_apply` 请求与工作区白名单共同授权自动交付：滚动 P/A/U 三方合并、M 独立检查、原生图中断、容器释放、U→M 原子写回、逐文件日志和安全恢复。原目录 Git index 不由服务恢复或写入；`candidate_only` 保持候选行为。详情见 [自动交付使用说明](docs/code-delivery.md) 和 [验收记录](docs/code-delivery-acceptance.md)。迁移头为 `core_0012`；阶段三真实模型语义验收仍未通过，不能据确定性测试启用生产白名单。

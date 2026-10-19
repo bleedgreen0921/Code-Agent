@@ -17,7 +17,7 @@ def main():
             "AGENT_DATABASE_URL requires a dedicated username and password"
         )
     with psycopg.connect(os.environ["MIGRATION_DATABASE_URL"]) as conn:
-        if validate_database(conn) != "core_0011":
+        if validate_database(conn) != "core_0012":
             raise RuntimeError("Run db.migrate before bootstrap")
         owner = conn.execute("SELECT current_user").fetchone()[0]
         if role == owner:
@@ -83,6 +83,13 @@ def main():
             "code_repair_candidates",
             "code_repair_revisions",
             "code_repair_attempts",
+            "code_deliveries",
+            "code_workspace_observations",
+            "code_integrations",
+            "code_delivery_files",
+            "code_delivery_events",
+            "code_workspace_occupancy",
+
             "store",
             "checkpoints",
             "checkpoint_blobs",

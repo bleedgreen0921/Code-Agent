@@ -45,6 +45,7 @@ class RepairExecutionScope(ExecutionScope):
         self.checks = {}
         self.tool_results = {}
         self.check_lock = self.lock
+        self.delivery = None
 
     async def managed_io(self, operation, *args):
         task = asyncio.create_task(asyncio.to_thread(operation, *args))
@@ -61,7 +62,27 @@ class RepairExecutionScope(ExecutionScope):
     async def prepare(self):
         from agent_service.repair_reports import RepairLedger
 
+        from pathlib import Path
+        from agent_service.delivery_fs import workspace_identity
+
+        metadata = await self.store.code_metadata(self.row["task_id"])
+        original_identity = None
+        if metadata and metadata["request"].get("delivery_mode") == "auto_apply":
+            original_identity = await self.managed_io(
+                workspace_identity,
+                Path(self.registry.workspaces[self.row["workspace_id"]]),
+            )
         await self.prepare_snapshot()
+        if self.row["_code"]["request"]["delivery_mode"] == "auto_apply":
+            from agent_service.delivery_pipeline import DeliveryPipeline
+
+            if original_identity is None:
+                raise CodeFailure(
+                    "SNAPSHOT_INVALID",
+                    "Initial automatic delivery root identity is unavailable",
+                )
+            record = await self.store.create_delivery(self.row, original_identity)
+            self.delivery = DeliveryPipeline(self, record)
         self.baseline_root = self.snapshot_root
         self.baseline = source_manifest(self.manifest["manifest"])
         self.contexts = await self.store.repair_context_manifest(

@@ -14,6 +14,10 @@ async def inspect():
             "code_execution_resources": await resources.store.code_resources(),
             "background_operations": await resources.store.operations(),
             "external_operations": await resources.store.external_operations(),
+            "deliveries": await resources.store.delivery_diagnostics(),
+            "delivery_filesystems": dict(
+                resources.registry.repair.settings.auto_apply_workspaces
+            ),
             "unresolved": await resources.store.unresolved(),
         }
 

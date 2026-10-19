@@ -83,6 +83,7 @@ def main():
     )
     env["AGENT_REVIEW_EXAMPLE_DIR"] = str(output / "review-examples")
     env["AGENT_REPAIR_EXAMPLE_DIR"] = str(output / "repair-examples")
+    env["AGENT_DELIVERY_EXAMPLE_DIR"] = str(output / "delivery-examples")
     compose = [
         "docker",
         "compose",
@@ -176,7 +177,7 @@ def main():
             text=True,
         ).strip()
         command([sys.executable, "-m", "db.migrate"])
-        metadata["checks"].append("core_0011 migration passed")
+        metadata["checks"].append("core_0012 migration passed")
         command([sys.executable, "-m", "db.bootstrap"])
         metadata["checks"].append("runtime bootstrap passed")
         command([sys.executable, "-m", "db.doctor", "--json"])

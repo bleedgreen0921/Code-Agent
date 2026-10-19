@@ -245,12 +245,16 @@ class TaskStore:
         await self.task_transition(
             conn, task_id, "failed" if code else "cancelling", code
         )
+        await conn.execute(
+            "UPDATE agent.code_deliveries SET cancel_requested=true WHERE task_id=%s",
+            (task_id,),
+        )
         runs = await (
             await conn.execute(
                 """UPDATE agent.runs SET
             status=CASE WHEN status='queued' THEN 'cancelled' ELSE 'cancelling' END,
             finished_at=CASE WHEN status='queued' THEN clock_timestamp() ELSE NULL END
-            WHERE task_id=%s AND status IN ('queued','running') RETURNING id,status""",
+            WHERE task_id=%s AND status IN ('queued','running','delivering') RETURNING id,status""",
                 (task_id,),
             )
         ).fetchall()
@@ -288,6 +292,14 @@ class TaskStore:
         ).fetchall()
         for task in tasks:
             tid = task["id"]
+            delivery = await (
+                await conn.execute(
+                    "SELECT * FROM agent.code_deliveries WHERE task_id=%s AND (status IN ('pending','applying','needs_recovery') OR (status='applied' AND phase<>'published'))",
+                    (tid,),
+                )
+            ).fetchone()
+            if delivery and delivery["checkpoint"]:
+                continue
             runs = await (
                 await conn.execute(
                     "SELECT * FROM agent.runs WHERE task_id=%s ORDER BY execution_no",
@@ -300,7 +312,8 @@ class TaskStore:
                 )
             ).fetchall()
             active = any(
-                r["status"] in ("queued", "running", "cancelling") for r in runs
+                r["status"] in ("queued", "running", "delivering", "cancelling")
+                for r in runs
             )
             unreleased = any(o["cleanup_state"] != "released" for o in ops)
             unfinished = any(o["state"] not in OP_TERMINAL for o in ops)
@@ -405,7 +418,7 @@ class TaskStore:
         for task in tasks:
             counts = await (
                 await conn.execute("""SELECT count(*) FILTER(WHERE status='queued') AS queued,count(*) AS unfinished
-                FROM agent.runs WHERE status IN ('queued','running','cancelling')""")
+                FROM agent.runs WHERE status IN ('queued','running','delivering','cancelling')""")
             ).fetchone()
             if (
                 counts["queued"] >= self.settings.max_queued_runs
@@ -414,7 +427,7 @@ class TaskStore:
                 break
             if await (
                 await conn.execute(
-                    "SELECT 1 FROM agent.runs WHERE task_id=%s AND status IN ('queued','running','cancelling')",
+                    "SELECT 1 FROM agent.runs WHERE task_id=%s AND status IN ('queued','running','delivering','cancelling')",
                     (task["id"],),
                 )
             ).fetchone():

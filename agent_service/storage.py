@@ -19,7 +19,7 @@ from agent_service.diagnostics import DiagnosticStore
 from agent_service.code_store import CodeStore
 
 log = logging.getLogger(__name__)
-ACTIVE = ("queued", "running", "cancelling")
+ACTIVE = ("queued", "running", "delivering", "cancelling")
 TERMINAL = ("completed", "failed", "cancelled")
 ADMISSION_LOCK = 81431002
 
@@ -40,7 +40,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
             revisions = await (
                 await conn.execute("SELECT version_num FROM agent.alembic_version")
             ).fetchall()
-            if revisions != [{"version_num": "core_0011"}]:
+            if revisions != [{"version_num": "core_0012"}]:
                 raise RuntimeError("Core database baseline required")
             await conn.execute("SELECT 1 FROM agent.checkpoints LIMIT 1")
             await conn.execute("SELECT 1 FROM agent.store LIMIT 1")
@@ -56,7 +56,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
                     signature[key] = [list(r.values()) for r in rows]
             if (
                 signature
-                != json.loads((ROOT / "structure.json").read_text())["core_0011"]
+                != json.loads((ROOT / "structure.json").read_text())["core_0012"]
             ):
                 raise RuntimeError("Core structure mismatch")
             from langgraph.store.postgres import PostgresStore
@@ -137,7 +137,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
             error_code=CASE WHEN status='queued' THEN 'QUEUE_TIMEOUT'
                 WHEN lease_until<=clock_timestamp() THEN 'LEASE_EXPIRED' ELSE 'RUN_TIMEOUT' END
             WHERE (status='queued' AND queue_deadline<=clock_timestamp()) OR
-                (status IN ('running','cancelling') AND (lease_until<=clock_timestamp() OR deadline_at<=clock_timestamp()))
+                (status IN ('running','cancelling') AND (lease_until<=clock_timestamp() OR deadline_at<=clock_timestamp()) AND NOT EXISTS(SELECT 1 FROM agent.code_deliveries d WHERE d.run_id=agent.runs.id AND d.checkpoint IS NOT NULL AND d.status<>'rolled_back'))
             RETURNING id,status,error_code""")
         ).fetchall()
         for row in rows:
@@ -290,7 +290,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
                     )
                 busy = await (
                     await conn.execute(
-                        "SELECT 1 FROM agent.runs WHERE conversation_id=%s AND status IN ('queued','running','cancelling')",
+                        "SELECT 1 FROM agent.runs WHERE conversation_id=%s AND status IN ('queued','running','delivering','cancelling')",
                         (conversation_id,),
                     )
                 ).fetchone()
@@ -325,7 +325,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
                 )
             counts = await (
                 await conn.execute(
-                    "SELECT count(*) FILTER(WHERE status='queued') AS queued,count(*) AS unfinished FROM agent.runs WHERE status IN ('queued','running','cancelling')"
+                    "SELECT count(*) FILTER(WHERE status='queued') AS queued,count(*) AS unfinished FROM agent.runs WHERE status IN ('queued','running','delivering','cancelling')"
                 )
             ).fetchone()
             if (
@@ -426,6 +426,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
                 count(*) FILTER(WHERE status='running' AND lease_until>clock_timestamp()) AS running_lease_valid,
                 count(*) FILTER(WHERE status='running' AND lease_until<=clock_timestamp()) AS running_lease_expired,
                 count(*) FILTER(WHERE status='cancelling') AS cancelling,
+                count(*) FILTER(WHERE status='delivering') AS delivering,
                 min(created_at) FILTER(WHERE status='queued' AND queue_deadline>clock_timestamp()) AS oldest_claimable_created_at
                 FROM agent.runs""")
             ).fetchone()
@@ -473,15 +474,17 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
                 await conn.execute(
                     """SELECT e.run_id,r.task_id,e.workspace_root FROM agent.execution_resources e JOIN agent.runs r ON r.id=e.run_id WHERE e.state<>'released'
                     UNION ALL SELECT e.run_id,r.task_id,e.workspace_root FROM agent.code_execution_resources e JOIN agent.runs r ON r.id=e.run_id WHERE e.state<>'released'
-                    UNION ALL SELECT run_id,task_id,workspace_root FROM agent.background_operations WHERE backend='docker' AND cleanup_state<>'released'"""
+                    UNION ALL SELECT run_id,task_id,workspace_root FROM agent.background_operations WHERE backend='docker' AND cleanup_state<>'released'
+                    UNION ALL SELECT run_id,task_id,workspace_root FROM agent.code_workspace_occupancy WHERE released_at IS NULL"""
                 )
             ).fetchall()
             n = (
                 await (
                     await conn.execute("""SELECT count(*) AS n FROM (
-                SELECT id FROM agent.runs WHERE status IN ('running','cancelling')
+                SELECT id FROM agent.runs WHERE status IN ('running','delivering','cancelling')
                 UNION SELECT run_id FROM agent.execution_resources WHERE state <> 'released'
                 UNION SELECT run_id FROM agent.code_execution_resources WHERE state <> 'released'
+                UNION SELECT run_id FROM agent.code_workspace_occupancy WHERE released_at IS NULL
             ) capacity""")
                 ).fetchone()
             )["n"]
@@ -650,7 +653,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
             row = await (
                 await conn.execute(
                     """UPDATE agent.runs SET lease_until=clock_timestamp()+%s*interval '1 second'
-                WHERE id=%s AND lease_token=%s AND status IN ('running','cancelling')
+                WHERE id=%s AND lease_token=%s AND status IN ('running','delivering','cancelling')
                 AND lease_until>clock_timestamp() AND deadline_at>clock_timestamp() RETURNING status,lease_until""",
                     (self.settings.lease_seconds, run_id, token),
                 )
@@ -696,6 +699,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
             ).fetchone()
             if row["lease_token"] != token or row["status"] not in (
                 "running",
+                "delivering",
                 "cancelling",
             ):
                 return False
@@ -786,7 +790,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
                 await conn.execute(
                     """UPDATE agent.runs SET status=%s,answer=%s,final_checkpoint=%s,error_code=%s,failure_info=%s,verification=%s,
                 finished_at=clock_timestamp() WHERE id=%s AND lease_token=%s
-                AND status IN ('running','cancelling') AND lease_until>clock_timestamp()
+                AND status IN ('running','delivering','cancelling') AND lease_until>clock_timestamp()
                 AND deadline_at>clock_timestamp() RETURNING id""",
                     (
                         status,

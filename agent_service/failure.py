@@ -279,6 +279,13 @@ _register(
 )
 
 
+_register(
+    "DELIVERY_CONFLICT DELIVERY_REFRESH_EXHAUSTED DELIVERY_CONTROL_INVALID DELIVERY_EVIDENCE_INVALID DELIVERY_NEEDS_RECOVERY DELIVERY_STOPPED",
+    "execution", "unknown", "reconcile_original",
+    "Automatic delivery stopped; consult its persistent delivery record and file journal.",
+)
+
+
 def failure_info(code="EXECUTION_FAILED", *, effect=None, recovery=None):
     code = code if code in SPECS else "EXECUTION_FAILED"
     category, default_effect, default_recovery, message = SPECS[code]

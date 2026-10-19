@@ -14,6 +14,7 @@ from contracts.code import CodeTaskCreate
 from contracts.review import CodeReviewCreate
 from agent_service.review_store import ReviewStore
 from agent_service.repair_store import RepairStore
+from agent_service.delivery_store import DeliveryStore
 from contracts.repair import CodeRepairCreate
 from contracts.errors import ApiError
 from contracts.v1 import ErrorCode
@@ -23,7 +24,7 @@ def public_artifact(row):
     return {k: v for k, v in row.items() if k != "storage_key"}
 
 
-class CodeStore(RepairStore, ReviewStore):
+class CodeStore(DeliveryStore, RepairStore, ReviewStore):
     @property
     def artifact_storage(self):
         return ArtifactStorage(
@@ -64,12 +65,20 @@ class CodeStore(RepairStore, ReviewStore):
         try:
             suite, checks = registry.select(body.workspace_id, body.check_suite_id)
             if body.stage == "repair":
+                if (
+                    body.delivery_mode == "auto_apply"
+                    and body.workspace_id not in registry.settings.auto_apply_workspaces
+                ):
+                    raise ValueError(
+                        "Automatic delivery is not authorized for this workspace"
+                    )
                 acceptance = registry.select_acceptance(
                     body.workspace_id, body.acceptance_suite_id
                 )
                 registry.validate_budget(
                     checks,
                     acceptance=acceptance,
+                    auto_apply=body.delivery_mode == "auto_apply",
                     run_seconds=min(
                         self.settings.run_timeout, self.settings.task_timeout
                     ),
@@ -196,7 +205,7 @@ class CodeStore(RepairStore, ReviewStore):
         live = await (
             await conn.execute(
                 """SELECT 1 FROM agent.runs WHERE id=%s AND lease_token=%s
-            AND status='running' AND lease_until>clock_timestamp() AND deadline_at>clock_timestamp()""",
+            AND status IN ('running','delivering') AND lease_until>clock_timestamp() AND deadline_at>clock_timestamp()""",
                 (row["id"], row["lease_token"]),
             )
         ).fetchone()
@@ -372,8 +381,8 @@ class CodeStore(RepairStore, ReviewStore):
         return await (
             await conn.execute(
                 """INSERT INTO agent.code_execution_resources
-            (id,run_id,lease_token,worker_id,purpose,workspace_root,execution_root,snapshot_id,container_name)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+            (id,run_id,lease_token,worker_id,purpose,workspace_root,execution_root,snapshot_id,container_name,generation)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE((SELECT generation FROM agent.execution_resources WHERE run_id=%s),0)) RETURNING *""",
                 (
                     rid,
                     row["id"],
@@ -384,6 +393,7 @@ class CodeStore(RepairStore, ReviewStore):
                     str(root),
                     row.get("_snapshot_id"),
                     name,
+                    row["id"],
                 ),
             )
         ).fetchone()
@@ -547,8 +557,13 @@ class CodeStore(RepairStore, ReviewStore):
                     **(
                         {
                             "version": 1,
-                            "delivery_mode": "candidate_only",
-                            "delivery_status": "not_applied",
+                            "delivery_mode": authority["delivery_mode"],
+                            "delivery_status": authority["delivery_status"],
+                            **(
+                                {"delivery": authority["delivery"]}
+                                if authority["delivery_mode"] == "auto_apply"
+                                else {}
+                            ),
                         }
                         if row.get("_code", {}).get("stage") == "repair"
                         else {}
@@ -727,6 +742,7 @@ class CodeStore(RepairStore, ReviewStore):
                 WHERE t.status IN ('completed','failed','cancelled') AND t.finished_at<clock_timestamp()-%s*interval '1 second'
                 AND NOT EXISTS(SELECT 1 FROM agent.task_dependencies d JOIN agent.tasks dep ON dep.id=d.task_id
                     WHERE d.dependency_id=t.id AND dep.status NOT IN ('completed','failed','cancelled'))
+                AND NOT EXISTS(SELECT 1 FROM agent.code_deliveries d WHERE d.task_id=t.id AND (d.status IN ('pending','applying','needs_recovery') OR (d.status='applied' AND d.phase<>'published')))
                 AND NOT EXISTS(SELECT 1 FROM agent.execution_resources e JOIN agent.runs r ON r.id=e.run_id WHERE r.task_id=t.id AND e.state<>'released')
                 AND NOT EXISTS(SELECT 1 FROM agent.code_execution_resources e JOIN agent.runs r ON r.id=e.run_id WHERE r.task_id=t.id AND e.state<>'released')
                 AND (EXISTS(SELECT 1 FROM agent.code_artifacts a WHERE a.task_id=t.id AND a.state<>'deleted')
@@ -736,6 +752,7 @@ class CodeStore(RepairStore, ReviewStore):
                 )
             ).fetchall()
             for task in tasks:
+                await self.gc_delivery_content(conn, task["id"])
                 artifacts = await (
                     await conn.execute(
                         "SELECT * FROM agent.code_artifacts WHERE task_id=%s AND state<>'deleted' FOR UPDATE",
@@ -831,6 +848,7 @@ class CodeStore(RepairStore, ReviewStore):
             for family, table in (
                 ("candidates", "code_repair_candidates"),
                 ("revisions", "code_repair_revisions"),
+                ("observations", "code_workspace_observations"),
                 ("snapshots", "code_snapshots"),
             ):
                 directory = self.artifact_storage.path(family + "/" + "0" * 32).parent
@@ -860,7 +878,8 @@ class CodeStore(RepairStore, ReviewStore):
 
     async def reconcile_code_tasks(self, conn):
         await conn.execute("""UPDATE agent.code_repair_candidates c SET status=t.status FROM agent.tasks t
-            WHERE c.task_id=t.id AND t.status IN ('failed','cancelled') AND c.status NOT IN ('deleted','failed','cancelled')""")
+            WHERE c.task_id=t.id AND t.status IN ('failed','cancelled') AND c.status NOT IN ('deleted','failed','cancelled')
+            AND NOT EXISTS(SELECT 1 FROM agent.code_deliveries d WHERE d.run_id=c.run_id AND d.status='applied')""")
         await conn.execute("""UPDATE agent.code_repair_attempts a SET status='inconclusive',
             feedback='{"reason":"interrupted_execution","replayed":false}'::jsonb,finished_at=clock_timestamp()
             FROM agent.runs r WHERE a.run_id=r.id AND a.status='running'

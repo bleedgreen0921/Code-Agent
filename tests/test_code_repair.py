@@ -146,11 +146,18 @@ async def export_repair(resources, task_id, destination):
                     kind = artifact["kind"]
                     suffix = (
                         ".zip"
-                        if kind in ("repair_package", "repair_baseline")
+                        if kind
+                        in (
+                            "repair_package",
+                            "repair_baseline",
+                            "delivery_package",
+                            "integration_package",
+                        )
                         else ".md"
                         if kind.endswith("markdown")
                         else ".diff"
-                        if kind == "repair_patch"
+                        if kind
+                        in ("repair_patch", "delivery_patch", "integration_patch")
                         else ".log"
                         if kind.endswith("log")
                         else ".json"

@@ -2,7 +2,10 @@
 name: isolated-repair
 description: Repair an isolated candidate with versioned evidence and independent acceptance.
 ---
-The user requested a candidate-only repair. Original workspace files are never changed.
+The trusted request specifies candidate_only or auto_apply. Edit only the isolated candidate.
+In auto_apply, the host controller merges user changes, validates the final version and
+delivers automatically. Never invoke delivery operations yourself. Preserve user changes
+installed by trusted merge feedback; reread source after an integration.
 Search current candidate code, read relevant functions, callers and exception paths,
 then explain the cause with evidence and explicitly distinguish inference from facts.
 Use read_file for current file SHA-256 and delivered complete line ranges.

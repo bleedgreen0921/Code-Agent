@@ -1,4 +1,4 @@
-"""Candidate-only repair inputs. Acceptance authority is never model supplied."""
+"""Isolated repair and explicit automatic delivery inputs. Acceptance authority is never model supplied."""
 
 from typing import Literal
 from uuid import UUID
@@ -11,7 +11,7 @@ from contracts.v1 import StrictModel
 
 class CodeRepairCreate(CodeTaskCreate):
     stage: Literal["repair"] = "repair"
-    delivery_mode: Literal["candidate_only"]
+    delivery_mode: Literal["candidate_only", "auto_apply"]
     target: WorkspaceTarget = Field(default_factory=WorkspaceTarget)
     acceptance_suite_id: str | None = Field(default=None, min_length=1)
 
@@ -50,3 +50,12 @@ class RepairReportV1(StrictModel):
     delivery_status: Literal["not_applied"] = "not_applied"
     report: RepairDraftV1
     authority: dict
+
+
+class DeliveryReportV1(StrictModel):
+    version: Literal[1] = 1
+    delivery_mode: Literal["auto_apply"] = "auto_apply"
+    delivery_status: Literal["applied"] = "applied"
+    report: RepairDraftV1
+    authority: dict
+    delivery: dict

@@ -43,6 +43,10 @@ class CodeRepairSettings(CodeAnalysisSettings):
     acceptance_suites: dict[str, tuple[str, ...]] = Field(default_factory=dict)
     default_acceptance_suites: dict[str, str] = Field(default_factory=dict)
 
+    auto_apply_workspaces: dict[str, str] = Field(default_factory=dict)
+    delivery_seconds: int = Field(default=60, ge=1, le=60)
+    delivery_reserve_seconds: int = Field(default=120, ge=120)
+
     @field_validator("profile")
     @classmethod
     def reserved_profile(cls, value):
@@ -132,6 +136,20 @@ class RepairRegistry(CodeRegistry):
         acceptance=(),
     ):
         super().__init__(settings, workspaces, execution, definitions, adapters)
+        for workspace, private in settings.auto_apply_workspaces.items():
+            if workspace not in workspaces:
+                raise ValueError("Unknown automatic delivery workspace")
+            for other in workspaces.values():
+                if Path(private).is_relative_to(other) or Path(other).is_relative_to(
+                    private
+                ):
+                    raise ValueError(
+                        "Private delivery storage overlaps a registered workspace"
+                    )
+            from agent_service.delivery_fs import atomic_probe, validate_private
+
+            validate_private(Path(workspaces[workspace]), Path(private))
+            atomic_probe(Path(private))
         self.acceptance = MappingProxyType({s.id: s for s in acceptance})
         if len(self.acceptance) != len(acceptance):
             raise ValueError("Duplicate acceptance suite")
@@ -152,10 +170,15 @@ class RepairRegistry(CodeRegistry):
                 raise ValueError("Unauthorized acceptance suite")
         for workspace, suite in settings.default_acceptance_suites.items():
             self.select_acceptance(workspace, suite)
+        from agent_service.delivery_merge import git_algorithm
+
         self.manifest.update(
             report_schema=RepairDraftV1.model_json_schema(),
             acceptance=[s.manifest() for s in sorted(acceptance, key=lambda s: s.id)],
             candidate_policy="repair-candidate-v1",
+            delivery_policy="auto-apply-v1",
+            merge_algorithm=git_algorithm() if settings.auto_apply_workspaces else None,
+            auto_apply_workspaces=settings.auto_apply_workspaces,
         )
         self.manifest = json.loads(json.dumps(self.manifest))
 
@@ -171,9 +194,13 @@ class RepairRegistry(CodeRegistry):
             raise ValueError("An authorized independent acceptance suite is required")
         return self.acceptance[suite]
 
-    def validate_budget(self, checks, *, acceptance=None, run_seconds=None):
+    def validate_budget(
+        self, checks, *, acceptance=None, run_seconds=None, auto_apply=False
+    ):
         # Baseline acceptance + one full gate must fit even before a model is called.
-        if self.settings.check_calls < len(checks) + 2:
+        if self.settings.check_calls < (
+            2 * (len(checks) + 1) + 1 if auto_apply else len(checks) + 2
+        ):
             raise ValueError(
                 "Budget cannot fit baseline and one required candidate gate"
             )
@@ -187,11 +214,14 @@ class RepairRegistry(CodeRegistry):
                     for c in checks
                 ),
             )
-            available = (
-                min(self.settings.run_seconds, run_seconds or self.settings.run_seconds)
-                - self.settings.reserve_seconds
+            available = min(
+                self.settings.run_seconds, run_seconds or self.settings.run_seconds
+            ) - (
+                self.settings.delivery_reserve_seconds
+                if auto_apply
+                else self.settings.reserve_seconds
             )
-            if baseline_seconds + gate_seconds > available:
+            if baseline_seconds + gate_seconds * (2 if auto_apply else 1) > available:
                 raise ValueError(
                     "Time budget cannot fit baseline and one required candidate gate"
                 )

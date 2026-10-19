@@ -40,7 +40,7 @@ class DiagnosticStore:
                 (list(delivered), run_id),
             )
         ).fetchone()
-        if facts["status"] != "running" or not facts["live"]:
+        if facts["status"] not in ("running", "delivering") or not facts["live"]:
             raise ExternalFailure("LEASE_EXPIRED")
         if facts["task_status"] in ("failed", "cancelled", "cancelling", "completed"):
             raise ExternalFailure(facts["task_error"] or "WORKER_STOPPED")
@@ -98,6 +98,12 @@ class DiagnosticStore:
                        false,true,CASE WHEN e.state='cleanup_failed' THEN 'RESOURCE_CLEANUP_FAILED'
                                       ELSE 'RESOURCE_RELEASE_UNCONFIRMED' END
                 FROM agent.code_execution_resources e JOIN scoped r ON r.id=e.run_id WHERE e.state<>'released'
+                UNION ALL
+                SELECT 'delivery',d.id,d.run_id,r.task_id,d.status,NULL,d.created_at,
+                       d.status='needs_recovery',true,'DELIVERY_NEEDS_RECOVERY'
+                FROM agent.code_deliveries d JOIN scoped r ON r.id=d.run_id
+                JOIN agent.code_workspace_occupancy o ON o.delivery_id=d.id
+                WHERE o.released_at IS NULL
             ), counts AS (
                 SELECT count(*) FILTER(WHERE unknown_operation) AS unknown_operations,
                        count(*) FILTER(WHERE unreleased) AS unreleased_resources,
