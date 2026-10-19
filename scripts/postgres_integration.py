@@ -75,6 +75,7 @@ def main():
         LANGSMITH_TRACING="false",
         LANGCHAIN_TRACING_V2="false",
     )
+    env['AGENT_REVIEW_EXAMPLE_DIR'] = str(output / 'review-examples')
     compose = [
         "docker",
         "compose",
@@ -112,7 +113,7 @@ def main():
         },
         "sources": {
             str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
-            for directory in ("agent_service", "db", "execution", "scripts", "tests")
+            for directory in ("agent_service", "contracts", "db", "execution", "scripts", "tests")
             for p in sorted((ROOT / directory).rglob("*"))
             if p.is_file()
             and (p.suffix in (".py", ".sql", ".json") or p.name == "Dockerfile")
@@ -161,7 +162,7 @@ def main():
             text=True,
         ).strip()
         command([sys.executable, "-m", "db.migrate"])
-        metadata["checks"].append("core_0009 migration passed")
+        metadata["checks"].append("core_0010 migration passed")
         command([sys.executable, "-m", "db.bootstrap"])
         metadata["checks"].append("runtime bootstrap passed")
         command([sys.executable, "-m", "db.doctor", "--json"])

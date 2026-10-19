@@ -835,9 +835,9 @@ def test_snapshot_unstable_retries_do_not_reparse_target(tmp_path, monkeypatch):
     real_metadata = helper.metadata
     observations = 0
 
-    def moving(git_instance, limits):
+    def moving(git_instance, limits, **options):
         nonlocal observations
-        value = real_metadata(git_instance, limits)
+        value = real_metadata(git_instance, limits, **options)
         observations += 1
         if observations == 1:
             git(root, "tag", "-f", "moving", "HEAD")
@@ -853,9 +853,9 @@ def test_snapshot_unstable_retries_do_not_reparse_target(tmp_path, monkeypatch):
     assert result["commit_sha"] == first and result["attempts"] == 2
     assert (tmp_path / "out/file").read_text() == "one"
 
-    def unstable(git_instance, limits):
+    def unstable(git_instance, limits, **options):
         nonlocal observations
-        value = real_metadata(git_instance, limits)
+        value = real_metadata(git_instance, limits, **options)
         observations += 1
         (root / "file").write_text(str(observations))
         return value

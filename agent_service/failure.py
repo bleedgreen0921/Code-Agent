@@ -257,7 +257,7 @@ _register(
     "Use the dedicated code task endpoint.",
 )
 _register(
-    "SNAPSHOT_UNSUPPORTED SNAPSHOT_UNSTABLE SNAPSHOT_INVALID SNAPSHOT_LIMIT",
+    "SNAPSHOT_UNSUPPORTED SNAPSHOT_UNSTABLE SNAPSHOT_INVALID SNAPSHOT_LIMIT REVIEW_RANGE_INVALID",
     "execution",
     "not_applicable",
     "stop",

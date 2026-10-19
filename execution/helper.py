@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 
+
 class VersionConflict(ValueError):
     pass
 
@@ -233,16 +234,50 @@ def main():
             if operation == "read_file" and request.get("evidence_mode"):
                 lines = result["content"].splitlines()
                 retained = []
-                for line in lines[:request.get("output_lines", 200)-12]:
-                    if len("\n".join([*retained, line]).encode()) > request.get("output_bytes", 16384)-1800:
+                for line in lines[: request.get("output_lines", 200) - 12]:
+                    if (
+                        len("\n".join([*retained, line]).encode())
+                        > request.get("output_bytes", 16384) - 1800
+                    ):
                         break
                     retained.append(line)
                 result["content"] = "\n".join(retained)
-                result["truncated"] = result["truncated"] or len(retained)<len(lines)
+                result["truncated"] = result["truncated"] or len(retained) < len(lines)
+        elif operation == "review_read_file":
+            from code_review import read_blob
+
+            result = read_blob(ROOT, args["range"], args["side"], args["path"], maximum)
+            start = args.get("start_line", 1)
+            selected = result.pop("lines")
+            result["content"] = ""
+            result["total_lines"] = len(selected)
+            result["records"] = [
+                {"line": n, "text": text}
+                for n, text in enumerate(selected, 1)
+                if start <= n < start + args.get("max_lines", 100)
+            ]
+            # Bound before stdout transport; complete records only, never partial lines.
+            while (
+                result["records"]
+                and len(json.dumps(result).encode()) > request["output_bytes"] * 2
+            ):
+                result["records"].pop()
+            result["next_line"] = (
+                start + len(result["records"])
+                if start + len(result["records"]) <= result["total_lines"]
+                else None
+            )
         elif operation in ("git_status", "git_log", "git_diff", "git_read_file"):
-            result = git_operation(ROOT, operation, args, maximum,
-                                   request.get("output_bytes", 16384) - (1800 if request.get("evidence_mode") else 0),
-                                   request.get("output_lines", 200) - (12 if request.get("evidence_mode") else 0))
+            result = git_operation(
+                ROOT,
+                operation,
+                args,
+                maximum,
+                request.get("output_bytes", 16384)
+                - (1800 if request.get("evidence_mode") else 0),
+                request.get("output_lines", 200)
+                - (12 if request.get("evidence_mode") else 0),
+            )
         elif operation in ("glob_search", "grep_search"):
             result = search(operation, args, maximum)
         else:
@@ -256,12 +291,37 @@ def main():
     except GitError as exc:
         print(json.dumps({"error": str(exc)[:500], "code": exc.code}))
     except UnicodeError:
-        print(json.dumps({"error": "Non-UTF-8 content; not fully read", "code": "GIT_UNSUPPORTED" if operation.startswith("git_") else "FILE_OPERATION_FAILED"}))
+        print(
+            json.dumps(
+                {
+                    "error": "Non-UTF-8 content; not fully read",
+                    "code": "GIT_UNSUPPORTED"
+                    if operation.startswith("git_")
+                    else "FILE_OPERATION_FAILED",
+                }
+            )
+        )
     except (ValueError, OSError) as exc:
         if operation.startswith("git_"):
-            print(json.dumps({"error": "Git source or object could not be fully read", "code": "GIT_READ_FAILED"}))
+            print(
+                json.dumps(
+                    {
+                        "error": "Git source or object could not be fully read",
+                        "code": "GIT_READ_FAILED",
+                    }
+                )
+            )
             return
-        print(json.dumps({"error": str(exc)[:500], "code": "FILE_VERSION_CONFLICT" if isinstance(exc, VersionConflict) else "FILE_OPERATION_FAILED"}))
+        print(
+            json.dumps(
+                {
+                    "error": str(exc)[:500],
+                    "code": "FILE_VERSION_CONFLICT"
+                    if isinstance(exc, VersionConflict)
+                    else "FILE_OPERATION_FAILED",
+                }
+            )
+        )
 
 
 if __name__ == "__main__":

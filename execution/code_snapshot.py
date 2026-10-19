@@ -100,23 +100,27 @@ def tree_records(git, commit, maximum):
     return result
 
 
-def metadata(git, limits):
+def metadata(git, limits, workspace=True):
     root = git.root / ".git"
-    if (
+    if workspace and (
         (root / "shallow").exists()
         or (root / "info/sparse-checkout").exists()
         or list(root.glob("sharedindex.*"))
     ):
         raise SnapshotError("Shallow, split and sparse indexes are unsupported")
     # Inspect flags, including sparse-checkout skip-worktree entries.
-    if any(
+    if workspace and any(
         line[:2].upper() == b"S "
         for line in git.run(
             ["ls-files", "-v"], maximum=limits["snapshot_bytes"]
         ).splitlines()
     ):
         raise SnapshotError("Sparse index is unsupported")
-    entries = git.run(["ls-files", "--stage", "-z"], maximum=limits["snapshot_bytes"])
+    entries = (
+        git.run(["ls-files", "--stage", "-z"], maximum=limits["snapshot_bytes"])
+        if workspace
+        else b""
+    )
     paths = []
     for entry in entries.split(b"\0"):
         if not entry:
@@ -140,7 +144,9 @@ def metadata(git, limits):
         "branch": branch,
         "refs": refs.decode("utf-8"),
         "index": hashlib.sha256(
-            optional(root, "index", limits["snapshot_bytes"]) or b""
+            (optional(root, "index", limits["snapshot_bytes"]) or b"")
+            if workspace
+            else b""
         ).hexdigest(),
         "head_file": (optional(root, "HEAD", 4096) or b"").decode("ascii"),
     }, paths
@@ -204,14 +210,19 @@ def prepare(source, output, target, limits):
     git = Git(source)
     # Resolve exactly once. Retries never reinterpret a moving user reference.
     fixed = git.resolve(target["ref"]) if target["kind"] == "commit" else None
+    index_target = target["kind"] == "index"
     resolved_at = time.time()
     end = time.monotonic() + limits["snapshot_seconds"]
     for attempt in range(3):
         if time.monotonic() >= end:
             break
         try:
-            before, tracked = metadata(git, limits)
-            initial = workspace_files(git, tracked, limits) if fixed is None else None
+            before, tracked = metadata(git, limits, workspace=fixed is None)
+            initial = (
+                workspace_files(git, tracked, limits)
+                if fixed is None and not index_target
+                else None
+            )
             if output.exists():
                 shutil.rmtree(output)
             output.mkdir()
@@ -226,8 +237,26 @@ def prepare(source, output, target, limits):
                     )
                 put(root, name, data, mode)
 
-            if fixed:
-                files = tree_records(git, fixed, limits["snapshot_bytes"])
+            if fixed or index_target:
+                if fixed:
+                    files = tree_records(git, fixed, limits["snapshot_bytes"])
+                else:
+                    files = []
+                    for entry in git.run(
+                        ["ls-files", "--stage", "-z"], maximum=limits["snapshot_bytes"]
+                    ).split(b"\0"):
+                        if entry:
+                            meta, path = entry.split(b"\t", 1)
+                            mode, blob, stage = meta.decode().split()
+                            if mode not in ("100644", "100755") or stage != "0":
+                                raise SnapshotError("Unsupported index content")
+                            files.append(
+                                (
+                                    path.decode("utf-8"),
+                                    blob,
+                                    0o755 if mode == "100755" else 0o644,
+                                )
+                            )
                 if len(files) > limits["file_count"]:
                     raise SnapshotError("Too many files", "SNAPSHOT_LIMIT")
                 for path, blob, mode in files:
@@ -292,7 +321,7 @@ def prepare(source, output, target, limits):
                 ["fsck", "--full", "--no-reflogs", "--no-dangling"],
                 maximum=limits["snapshot_bytes"],
             )
-            after, paths_after = metadata(git, limits)
+            after, paths_after = metadata(git, limits, workspace=fixed is None)
             if (
                 before != after
                 or tracked != paths_after
@@ -335,9 +364,22 @@ def prepare(source, output, target, limits):
 def main():
     try:
         req = json.load(sys.stdin)
-        result = prepare(
-            Path("/workspace"), Path("/snapshot/source"), req["target"], req["limits"]
-        )
+        if req.get("stage") == "review":
+            from code_review import prepare_review
+
+            result = prepare_review(
+                Path("/workspace"),
+                Path("/snapshot/source"),
+                req["target"],
+                req["limits"],
+            )
+        else:
+            result = prepare(
+                Path("/workspace"),
+                Path("/snapshot/source"),
+                req["target"],
+                req["limits"],
+            )
         # Manifest travels via the managed snapshot directory, never stdout limits.
         Path("/snapshot/manifest.json").write_text(json.dumps(result, sort_keys=True))
         print(

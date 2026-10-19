@@ -10,9 +10,25 @@ from types import MappingProxyType
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from contracts.code import AnalysisReportV1
+from contracts.review import ReviewReportV1
 
 VERSION = "code-analysis-v1"
 PROFILE = "code-analysis-isolated"
+REVIEW_PROFILE = "code-review-isolated"
+CODE_PROFILES = (PROFILE, REVIEW_PROFILE)
+REVIEW_TOOLS = (
+    "glob_search",
+    "grep_search",
+    "read_file",
+    "git_log",
+    "write_todos",
+    "read_skill",
+    "run_project_check",
+    "review_diff",
+    "review_read_file",
+    "read_review_execution",
+    "run_review_reproduction",
+)
 READ_TOOLS = (
     "glob_search",
     "grep_search",
@@ -67,6 +83,23 @@ class CodeAnalysisSettings(BaseModel):
     def reserved_profile(cls, value):
         if value != PROFILE:
             raise ValueError("The isolated analysis profile ID is reserved")
+        return value
+
+
+class CodeReviewSettings(CodeAnalysisSettings):
+    profile: str = REVIEW_PROFILE
+    model_calls: int = Field(default=24, ge=1, le=24)
+    tool_calls: int = Field(default=48, ge=1, le=48)
+    run_seconds: int = Field(default=600, ge=31, le=600)
+    reproduction_calls: int = Field(default=4, ge=0, le=4)
+    diff_bytes: int = Field(default=16 * 1024**2, ge=1, le=16 * 1024**2)
+    patch_bytes: int = Field(default=2 * 1024**2, ge=1, le=2 * 1024**2)
+
+    @field_validator("profile")
+    @classmethod
+    def reserved_profile(cls, value):
+        if value != REVIEW_PROFILE:
+            raise ValueError("The isolated review profile ID is reserved")
         return value
 
 
@@ -174,6 +207,8 @@ def assets():
         p: hashlib.sha256((root / p).read_bytes()).hexdigest()
         for p in (
             "code_snapshot.py",
+            "code_review.py",
+            "review_runner.py",
             "project_runner.py",
             "git_tools.py",
             "helper.py",
@@ -252,7 +287,11 @@ class CodeRegistry:
             json.dumps(
                 {
                     "version": VERSION,
-                    "report_schema": AnalysisReportV1.model_json_schema(),
+                    "report_schema": (
+                        ReviewReportV1
+                        if settings.profile == REVIEW_PROFILE
+                        else AnalysisReportV1
+                    ).model_json_schema(),
                     "settings": settings.model_dump(),
                     "checks": [
                         c.manifest() for c in sorted(definitions, key=lambda c: c.id)

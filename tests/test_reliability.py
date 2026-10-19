@@ -772,7 +772,7 @@ def test_core7_historical_cancel_migrates_conservatively(database):
             migrate.main()
             migrate.main()
         with psycopg.connect(historical) as conn:
-            assert migrate.validate_database(conn) == "core_0009"
+            assert migrate.validate_database(conn) == "core_0010"
             after = conn.execute(
                 "SELECT binding,result,error_code,cancel_sent_at,cleanup_state,failure_info FROM agent.background_operations"
             ).fetchone()

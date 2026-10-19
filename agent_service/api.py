@@ -241,11 +241,22 @@ async def cancel_operation(
 
 
 from contracts.code import CodeTaskCreate
+from contracts.review import CodeReviewCreate
+from typing import Annotated
+from pydantic import Discriminator, Tag
+
+
+def code_stage(value):
+    return value.get("stage", "analysis") if isinstance(value, dict) else value.stage
 
 
 @router.post("/code/tasks")
 async def create_code_task(
-    body: CodeTaskCreate,
+    body: Annotated[
+        Annotated[CodeTaskCreate, Tag("analysis")]
+        | Annotated[CodeReviewCreate, Tag("review")],
+        Discriminator(code_stage),
+    ],
     request: Request,
     response: Response,
     key: str | None = Header(None, alias="Idempotency-Key"),
@@ -285,9 +296,19 @@ async def code_artifact(task_id: UUID, artifact_id: UUID, request: Request):
     metadata, data = await db(request).code_artifact(task_id, artifact_id)
     media = (
         "text/markdown; charset=utf-8"
-        if metadata["kind"] == "analysis_markdown"
+        if metadata["kind"] in ("analysis_markdown", "review_markdown")
         else "application/json"
-        if metadata["kind"] in ("analysis_report", "source_evidence", "check_result")
+        if metadata["kind"]
+        in (
+            "analysis_report",
+            "review_report",
+            "source_evidence",
+            "review_evidence",
+            "review_changes",
+            "review_coverage",
+            "check_result",
+            "reproduction_result",
+        )
         else "text/plain; charset=utf-8"
     )
     return Response(
@@ -299,3 +320,23 @@ async def code_artifact(task_id: UUID, artifact_id: UUID, request: Request):
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+@router.get("/code/tasks/{task_id}/changes")
+async def review_changes(
+    task_id: UUID,
+    request: Request,
+    limit: int = Query(30, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    return await db(request).review_changes(task_id, limit, offset)
+
+
+@router.get("/code/tasks/{task_id}/reproductions")
+async def review_reproductions(
+    task_id: UUID,
+    request: Request,
+    limit: int = Query(30, ge=1, le=100),
+    cursor: UUID | None = None,
+):
+    return await db(request).code_page(task_id, "reproductions", limit, cursor)

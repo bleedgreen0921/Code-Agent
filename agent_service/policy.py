@@ -208,6 +208,13 @@ class ToolLifecycleMiddleware(AgentMiddleware):
                 )
             if self.output_limits:
                 result = self.limit_result(result)
+            authority = getattr(call.context, "execution_authority", None)
+            scope = (
+                authority.get("_code_scope") if isinstance(authority, dict) else None
+            )
+            ledger = getattr(scope, "evidence", None)
+            if ledger and hasattr(ledger, "confirm_delivery"):
+                await ledger.confirm_delivery(call.call_id, result)
             candidates = getattr(call.context, "result_delivery", None)
             if candidates is not None and call.call_id in candidates:
                 operation_id, expected = candidates.pop(call.call_id)

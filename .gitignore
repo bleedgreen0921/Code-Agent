@@ -77,3 +77,6 @@ Thumbs.db
 
 !/docs/可执行检查分析使用说明.md
 !/docs/可执行检查分析验收.md
+
+!/docs/code-review.md
+!/docs/code-review-acceptance.md

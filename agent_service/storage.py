@@ -40,7 +40,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
             revisions = await (
                 await conn.execute("SELECT version_num FROM agent.alembic_version")
             ).fetchall()
-            if revisions != [{"version_num": "core_0009"}]:
+            if revisions != [{"version_num": "core_0010"}]:
                 raise RuntimeError("Core database baseline required")
             await conn.execute("SELECT 1 FROM agent.checkpoints LIMIT 1")
             await conn.execute("SELECT 1 FROM agent.store LIMIT 1")
@@ -56,7 +56,7 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
                     signature[key] = [list(r.values()) for r in rows]
             if (
                 signature
-                != json.loads((ROOT / "structure.json").read_text())["core_0009"]
+                != json.loads((ROOT / "structure.json").read_text())["core_0010"]
             ):
                 raise RuntimeError("Core structure mismatch")
             from langgraph.store.postgres import PostgresStore
@@ -93,8 +93,14 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
                 raise RuntimeError(
                     "A separate runtime role without migration permissions is required"
                 )
-        if self.registry.code.settings.enabled:
-            root = Path(self.registry.code.settings.storage_root)
+        if self.registry.code.settings.enabled or self.registry.review.settings.enabled:
+            root = Path(
+                (
+                    self.registry.code
+                    if self.registry.code.settings.enabled
+                    else self.registry.review
+                ).settings.storage_root
+            )
             import os
 
             if (
@@ -167,9 +173,9 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
             await self.schedule_tasks(conn)
 
     def require_code_entry(self, profile, *, code_task=False):
-        from agent_service.code_registry import PROFILE
+        from agent_service.code_registry import CODE_PROFILES
 
-        if profile == PROFILE and not code_task:
+        if profile in CODE_PROFILES and not code_task:
             raise ApiError(
                 422, "CODE_TASK_REQUIRED", "Use POST /v1/code/tasks for this profile"
             )
@@ -523,9 +529,13 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
                         token,
                         min(
                             self.settings.run_timeout,
-                            self.registry.code.settings.run_seconds,
+                            self.registry.code_for(selected).settings.run_seconds,
                         )
-                        if selected["profile"] == self.registry.code.settings.profile
+                        if selected["profile"]
+                        in (
+                            self.registry.code.settings.profile,
+                            self.registry.review.settings.profile,
+                        )
                         else self.settings.run_timeout,
                         self.settings.lease_seconds,
                         selected["id"],
@@ -793,7 +803,11 @@ class Store(TaskStore, BackgroundStore, DiagnosticStore, CodeStore):
             if (
                 published
                 and status == "completed"
-                and row["profile"] == self.registry.code.settings.profile
+                and row["profile"]
+                in (
+                    self.registry.code.settings.profile,
+                    self.registry.review.settings.profile,
+                )
             ):
                 if not code_artifacts:
                     raise ValueError("A code task requires staged report artifacts")

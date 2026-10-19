@@ -11,6 +11,8 @@ from psycopg.types.json import Jsonb
 from agent_service.code_artifacts import ArtifactStorage, CodeFailure
 from agent_service.profiles import fingerprint
 from contracts.code import CodeTaskCreate
+from contracts.review import CodeReviewCreate
+from agent_service.review_store import ReviewStore
 from contracts.errors import ApiError
 from contracts.v1 import ErrorCode
 
@@ -19,17 +21,29 @@ def public_artifact(row):
     return {k: v for k, v in row.items() if k != "storage_key"}
 
 
-class CodeStore:
+class CodeStore(ReviewStore):
     @property
     def artifact_storage(self):
-        return ArtifactStorage(self.registry.code.settings.storage_root)
+        return ArtifactStorage(
+            (
+                self.registry.code
+                if self.registry.code.settings.enabled
+                else self.registry.review
+            ).settings.storage_root
+        )
 
     async def create_code_task(self, body, key=None):
         if not isinstance(body, CodeTaskCreate):
-            body = CodeTaskCreate.model_validate(body)
-        registry = self.registry.code
+            body = (
+                CodeReviewCreate if body.get("stage") == "review" else CodeTaskCreate
+            ).model_validate(body)
+        registry = (
+            self.registry.review if body.stage == "review" else self.registry.code
+        )
         if not registry.settings.enabled:
-            raise ApiError(422, ErrorCode.INVALID_REQUEST, "Code analysis is disabled")
+            raise ApiError(
+                422, ErrorCode.INVALID_REQUEST, "Requested code stage is disabled"
+            )
         try:
             suite, checks = registry.select(body.workspace_id, body.check_suite_id)
         except ValueError as exc:
@@ -69,7 +83,40 @@ class CodeStore:
                     (task_id,),
                 )
             ).fetchall()
+        review = None
+        reproduction_counts = []
+        summary = {}
+        if row["stage"] == "review":
+            async with self.pool.connection() as conn:
+                review = await (
+                    await conn.execute(
+                        "SELECT metadata FROM agent.code_review_ranges WHERE task_id=%s ORDER BY created_at DESC LIMIT 1",
+                        (task_id,),
+                    )
+                ).fetchone()
+                reproduction_counts = await (
+                    await conn.execute(
+                        "SELECT status,count(*) AS count FROM agent.code_review_reproductions WHERE task_id=%s GROUP BY status",
+                        (task_id,),
+                    )
+                ).fetchall()
+            if row["report_artifact_id"]:
+                try:
+                    _, data = await self.code_artifact(
+                        task_id, row["report_artifact_id"]
+                    )
+                    authority = json.loads(data)["authority"]
+                    summary = {
+                        k: authority[k]
+                        for k in ("finding_count", "coverage", "execution_notice")
+                    }
+                except ApiError as exc:
+                    if exc.status != 410:
+                        raise
         return {
+            **summary,
+            "resolved_range": review["metadata"] if review else None,
+            "reproductions": {r["status"]: r["count"] for r in reproduction_counts},
             "task_id": str(task_id),
             "status": task["status"],
             "stage": row["stage"],
@@ -120,7 +167,11 @@ class CodeStore:
 
     async def code_page(self, task_id, kind, limit=30, cursor=None):
         await self.code_task(task_id)
-        table = {"checks": "code_check_runs", "artifacts": "code_artifacts"}[kind]
+        table = {
+            "checks": "code_check_runs",
+            "artifacts": "code_artifacts",
+            "reproductions": "code_review_reproductions",
+        }[kind]
         async with self.pool.connection() as conn:
             rows = await (
                 await conn.execute(
@@ -159,7 +210,7 @@ class CodeStore:
         self, row, kind, data, *, metadata=None, artifact_id=None, maximum=None
     ):
         artifact_id = artifact_id or uuid4()
-        maximum = maximum or self.registry.code.settings.result_bytes
+        maximum = maximum or self.registry.code_for(row).settings.result_bytes
         key, checksum = self.artifact_storage.write(artifact_id, data, maximum)
         for attempt in range(3):
             try:
@@ -258,7 +309,7 @@ class CodeStore:
                 (str(root), row["_snapshot_id"], row["id"], row["lease_token"]),
             )
             await conn.execute(
-                "UPDATE agent.code_tasks SET phase='analysis' WHERE task_id=%s",
+                "UPDATE agent.code_tasks SET phase=stage WHERE task_id=%s",
                 (row["task_id"],),
             )
 
@@ -363,6 +414,7 @@ class CodeStore:
     async def reserve_code_check(self, row, call_id, check, root):
         async with self.locked() as conn:
             await self.code_live(conn, row)
+            await self.execution_identity(conn, row, call_id, "check")
             prior = await (
                 await conn.execute(
                     "SELECT * FROM agent.code_check_runs WHERE run_id=%s AND tool_call_id=%s",
@@ -371,15 +423,8 @@ class CodeStore:
             ).fetchone()
             if prior:
                 return prior, False
-            count = (
-                await (
-                    await conn.execute(
-                        "SELECT count(*) AS n FROM agent.code_check_runs WHERE run_id=%s",
-                        (row["id"],),
-                    )
-                ).fetchone()
-            )["n"]
-            if count >= self.registry.code.settings.check_calls:
+            count = await self.execution_count(conn, row)
+            if count >= self.registry.code_for(row).settings.check_calls:
                 return None, False
             resource = await self.reserve_code_resource(conn, row, "check", root)
             result = await (
@@ -431,6 +476,18 @@ class CodeStore:
             ).fetchone()
 
     async def stage_code_report(self, row, report, markdown, authority):
+        if row.get("_code", {}).get("stage") == "review":
+            coverage = row["_code_scope"].evidence.coverage(report)
+            await self.put_code_artifact(
+                row,
+                "review_coverage",
+                json.dumps(coverage, ensure_ascii=False, sort_keys=True).encode(),
+                metadata={
+                    "coverage_digest": fingerprint(coverage),
+                    "range_id": authority["range"]["range_id"],
+                },
+                maximum=self.registry.review.settings.diff_bytes * 2 + 65536,
+            )
         report_id, markdown_id = uuid4(), uuid4()
         authority = {
             **authority,
@@ -439,25 +496,37 @@ class CodeStore:
         }
         structured = await self.put_code_artifact(
             row,
-            "analysis_report",
+            "review_report"
+            if row.get("_code", {}).get("stage") == "review"
+            else "analysis_report",
             json.dumps(
                 {"report": report, "authority": authority},
                 ensure_ascii=False,
                 sort_keys=True,
             ).encode(),
             artifact_id=report_id,
-            maximum=self.registry.code.settings.report_bytes + 32768,
+            maximum=self.registry.code_for(row).settings.report_bytes
+            + (65536 if row.get("_code", {}).get("stage") == "review" else 32768),
         )
         rendered = await self.put_code_artifact(
             row,
-            "analysis_markdown",
+            "review_markdown"
+            if row.get("_code", {}).get("stage") == "review"
+            else "analysis_markdown",
             markdown.encode(),
             artifact_id=markdown_id,
-            maximum=self.registry.code.settings.report_bytes * 3,
+            maximum=self.registry.code_for(row).settings.report_bytes * 3,
         )
         return {"report": str(structured["id"]), "markdown": str(rendered["id"])}
 
     async def publish_code_report(self, conn, run, artifact_ids):
+        if run["profile"] == "code-review-isolated":
+            try:
+                return await self.publish_review_report(conn, run, artifact_ids)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise CodeFailure(
+                    "REPORT_INVALID", "Persisted Review report or evidence is invalid"
+                ) from exc
         # Called inside the same transaction as the successful Run completion.
         rows = await (
             await conn.execute(
@@ -577,8 +646,14 @@ class CodeStore:
         import shutil
 
         settings = self.registry.code.settings
-        if not settings.enabled:
+        if not settings.enabled and not self.registry.review.settings.enabled:
             return
+        if self.registry.review.settings.enabled:
+            retention = max(
+                settings.retention_seconds if settings.enabled else 0,
+                self.registry.review.settings.retention_seconds,
+            )
+            settings = settings.model_copy(update={"retention_seconds": retention})
         async with self.locked() as conn:
             tasks = await (
                 await conn.execute(
@@ -632,7 +707,9 @@ class CodeStore:
             # confirmed. Existing records (including active dependencies) win.
             directory = self.artifact_storage.path("artifacts/" + "0" * 32).parent
             if directory.exists():
-                cutoff = datetime.now(timezone.utc).timestamp() - settings.retention_seconds
+                cutoff = (
+                    datetime.now(timezone.utc).timestamp() - settings.retention_seconds
+                )
                 observed = 0
                 for path in directory.iterdir():
                     candidate = path.name.removeprefix(".pending-")

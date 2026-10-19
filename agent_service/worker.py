@@ -140,6 +140,12 @@ class Worker:
                 from agent_service.project_checks import project_check_tool
 
                 actual_tools["run_project_check"] = project_check_tool(scope)
+                if scope.row["_code"]["stage"] == "review":
+                    from agent_service.review_tools import review_tools
+
+                    actual_tools.update(
+                        {tool.name: tool for tool in review_tools(scope)}
+                    )
             instances, native_middleware = assemble(scope, profile.tools)
             actual_tools.update({tool.name: tool for tool in instances})
             execution_middleware = [
@@ -189,10 +195,10 @@ class Worker:
             self.model, self.settings, registry, binding, middleware
         )
         if row.get("_code_scope"):
-            snapshot["code_analysis"] = registry.code.manifest
+            snapshot["code_analysis"] = registry.code_for(row).manifest
             snapshot["middleware"].update(
-                model_call_limit=registry.code.settings.model_calls,
-                tool_call_limit=registry.code.settings.tool_calls,
+                model_call_limit=registry.code_for(row).settings.model_calls,
+                tool_call_limit=registry.code_for(row).settings.tool_calls,
             )
             snapshot["execution"].update(
                 snapshot_id=str(row["_snapshot_id"]),
@@ -201,7 +207,7 @@ class Worker:
                 read_only_workspace=True,
             )
             snapshot["run_timeout_seconds"] = min(
-                self.settings.run_timeout, registry.code.settings.run_seconds
+                self.settings.run_timeout, registry.code_for(row).settings.run_seconds
             )
             snapshot["deadline_at"] = row["deadline_at"].isoformat()
         # Retry only the DB operation, before invoking the graph even once.
@@ -248,8 +254,8 @@ class Worker:
             response_format=response_format,
             **(
                 {
-                    "model_call_limit": registry.code.settings.model_calls,
-                    "tool_call_limit": registry.code.settings.tool_calls,
+                    "model_call_limit": registry.code_for(row).settings.model_calls,
+                    "tool_call_limit": registry.code_for(row).settings.tool_calls,
                 }
                 if code_scope
                 else {}
@@ -352,14 +358,15 @@ class Worker:
             metadata = row["_code"]
             messages.append(
                 HumanMessage(
-                    content="Code analysis authority: "
+                    content="Code task authority: "
                     + json.dumps(
                         {
                             "snapshot_id": str(row["_snapshot_id"]),
                             "commit_sha": code_scope.manifest["commit_sha"],
                             "target": metadata["request"]["target"],
+                            "fixed_range": code_scope.manifest.get("review"),
                             "checks": [
-                                self.resources.registry.code.checks[c].manifest()
+                                code_scope.code.checks[c].manifest()
                                 for c in metadata["check_ids"]
                             ],
                             "checks_notice": "No checks configured; report static analysis only."
@@ -372,6 +379,13 @@ class Worker:
                 )
             )
         config = run_config(row["id"])
+        if code_scope:
+            # Every middleware hook consumes graph steps. Allow the configured
+            # model/tool budgets to be reached without an earlier recursion cap.
+            budgets = code_scope.code.settings
+            config["recursion_limit"] = max(
+                128, budgets.model_calls * 16 + budgets.tool_calls * 4 + 32
+            )
         config["callbacks"] = [row["_reported_usage"]]
         remaining_execution(context)
         state = await graph.ainvoke(
@@ -396,8 +410,14 @@ class Worker:
             report = await scope.evidence.verify_persisted(state["structured_response"])
             from agent_service.code_reports import markdown_report
 
-            authority = scope.evidence.authority()
-            answer = markdown_report(report, authority)
+            if row["_code"]["stage"] == "review":
+                from agent_service.review_reports import markdown_review
+
+                authority = scope.evidence.authority(report)
+                answer = markdown_review(report, authority)
+            else:
+                authority = scope.evidence.authority()
+                answer = markdown_report(report, authority)
             row["_code_artifacts"] = await self.db.stage_code_report(
                 row, report, answer, authority
             )
@@ -437,6 +457,8 @@ class Worker:
         """Only retry publication. An uncertain commit never causes model/tool replay."""
         if result.get("error_code") and "failure_info" not in result:
             result["failure_info"] = failure_info(result["error_code"])
+        from agent_service.code_artifacts import CodeFailure
+
         for attempt in range(3):
             try:
                 confirmed = await self.db.finish(
@@ -454,6 +476,15 @@ class Worker:
                             "lease_token"
                         ] and publication_matches(current, result)
                 return confirmed
+            except CodeFailure as exc:
+                # A rejected formal report rolls back completion. Publish only the
+                # failure on the same Run; never invoke the graph again.
+                result = {
+                    "error_code": exc.code,
+                    "failure_info": failure_info(exc.code),
+                }
+                if attempt == 2:
+                    return False
             except (psycopg.Error, OSError, TimeoutError):
                 # A commit acknowledgement may be lost after the transaction committed.
                 try:
@@ -506,7 +537,7 @@ class Worker:
         if is_code:
             cleanup_budget = max(
                 cleanup_budget,
-                self.resources.registry.code.settings.reserve_seconds
+                self.resources.registry.code_for(row).settings.reserve_seconds
                 - publication_reserve,
             )
         row["effective_deadline_at"] = row["deadline_at"] - timedelta(
@@ -815,7 +846,10 @@ class Worker:
             self.tasks[row["id"]] = asyncio.create_task(self.execute(row))
 
     async def run(self):
-        if self.resources.registry.code.settings.enabled:
+        if (
+            self.resources.registry.code.settings.enabled
+            or self.resources.registry.review.settings.enabled
+        ):
             from agent_service.code_execution import preflight
             from agent_service.execution import DockerClient
 

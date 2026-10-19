@@ -18,7 +18,7 @@ def main():
         asyncio.run(
             check_environment(registry.execution, checks=registry.check_definitions())
         )
-        if registry.code.settings.enabled:
+        if registry.code.settings.enabled or registry.review.settings.enabled:
             from agent_service.code_execution import preflight
             from agent_service.execution import DockerClient
 

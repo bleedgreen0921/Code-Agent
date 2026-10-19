@@ -12,6 +12,7 @@ from langchain_core.tools import ToolException
 from agent_service.code_artifacts import CodeFailure
 from agent_service.code_registry import VERSION, asset_digest
 from agent_service.code_reports import EvidenceLedger
+from agent_service.review_execution import ReviewExecution
 from agent_service.execution import ExecutionScope, recover_resources
 from agent_service.execution_errors import CleanupFailed, EnvironmentUnavailable
 from agent_service.profiles import fingerprint
@@ -69,13 +70,14 @@ def verify_snapshot(root, manifest, limits):
         )
 
 
-class CodeExecutionScope(ExecutionScope):
+class CodeExecutionScope(ReviewExecution, ExecutionScope):
     force_readonly = True
     fixed_env = {"PYTHONDONTWRITEBYTECODE": "1", "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
 
     def __init__(self, store, row, settings, registry):
         super().__init__(store, row, settings)
         self.registry = registry
+        self.code = registry.code_for(row)
         self.children = []
         self.manifest = None
         self.snapshot_root = None
@@ -120,7 +122,7 @@ class CodeExecutionScope(ExecutionScope):
             raise CodeFailure(
                 "CONFIGURATION_CHANGED", "Code task policy binding changed"
             )
-        limits = self.registry.code.settings.model_dump()
+        limits = self.code.settings.model_dump()
         sid, directory = await self.store.reserve_code_snapshot(
             self.row, metadata["request"]["target"]
         )
@@ -156,7 +158,11 @@ class CodeExecutionScope(ExecutionScope):
                     "-I",
                     "/opt/agent/code_snapshot.py",
                     stdin=json.dumps(
-                        {"target": metadata["request"]["target"], "limits": limits}
+                        {
+                            "target": metadata["request"]["target"],
+                            "limits": limits,
+                            "stage": metadata["stage"],
+                        }
                     ).encode(),
                     timeout=max(
                         0.01, (end - datetime.now(timezone.utc)).total_seconds()
@@ -185,7 +191,18 @@ class CodeExecutionScope(ExecutionScope):
         await self.store.seal_code_snapshot(
             self.row, self.manifest, self.snapshot_root, hashlib.sha256(raw).hexdigest()
         )
-        self.evidence = EvidenceLedger(self.store, self.row, self.manifest)
+        if metadata["stage"] == "review":
+            from agent_service.review_reports import ReviewLedger
+
+            document = json.loads((directory / "changes.json").read_bytes())
+            if document["range"] != self.manifest["review"]:
+                raise CodeFailure(
+                    "SNAPSHOT_INVALID", "Prepared range metadata mismatch"
+                )
+            await self.store.save_review_range(self.row, document)
+            self.evidence = ReviewLedger(self.store, self.row, self.manifest, document)
+        else:
+            self.evidence = EvidenceLedger(self.store, self.row, self.manifest)
         self.row["_code_scope"] = self
         mounted = await self.store.execution_resource(self.row["id"])
         if (
@@ -209,7 +226,7 @@ class CodeExecutionScope(ExecutionScope):
             verify_snapshot,
             self.snapshot_root,
             self.manifest,
-            self.registry.code.settings.model_dump(),
+            self.code.settings.model_dump(),
         )
         result = await super().file_call(name, args)
         if name.startswith("git_") and "content" in result:
@@ -230,13 +247,13 @@ class CodeExecutionScope(ExecutionScope):
             self.check_open()
             if self.remaining() < 1:
                 raise ToolException("Insufficient remaining analysis time for a check")
-            check = self.registry.code.checks[check_id]
+            check = self.code.checks[check_id]
             # Only a sealed verified root can be mounted for project execution.
             await asyncio.to_thread(
                 verify_snapshot,
                 self.snapshot_root,
                 self.manifest,
-                self.registry.code.settings.model_dump(),
+                self.code.settings.model_dump(),
             )
             record, created = await self.store.reserve_code_check(
                 self.row, call_id, check, self.snapshot_root
@@ -262,7 +279,7 @@ class CodeExecutionScope(ExecutionScope):
                 )
             seconds = min(
                 check.timeout,
-                self.registry.code.settings.check_seconds,
+                self.code.settings.check_seconds,
                 self.remaining(),
             )
             deadline = min(
@@ -272,7 +289,7 @@ class CodeExecutionScope(ExecutionScope):
             scope = await self.child(
                 "check", self.snapshot_root, resource=resource, deadline=deadline
             )
-            adapter = self.registry.code.adapters[check.adapter_id]
+            adapter = self.code.adapters[check.adapter_id]
             raw, logs, exit_code, timed_out, oom = b"", b"", None, False, False
             try:
                 await scope.prepare()
@@ -291,8 +308,8 @@ class CodeExecutionScope(ExecutionScope):
                             (deadline - datetime.now(timezone.utc)).total_seconds(),
                         ),
                         maximum=max(
-                            self.registry.code.settings.result_bytes,
-                            self.registry.code.settings.log_bytes,
+                            self.code.settings.result_bytes,
+                            self.code.settings.log_bytes,
                         )
                         + 1,
                         check=False,
@@ -316,7 +333,7 @@ class CodeExecutionScope(ExecutionScope):
             finally:
                 if not await scope.close():
                     raise CleanupFailed("Check container cleanup unconfirmed")
-            settings = self.registry.code.settings
+            settings = self.code.settings
             result = adapter.parse(
                 raw[: settings.result_bytes],
                 exit_code=exit_code,
@@ -374,6 +391,8 @@ class CodeExecutionScope(ExecutionScope):
             if record["log_artifact_id"]
             else None,
         }
+        if self.row["_code"]["stage"] == "review":
+            value["content_digest"] = self.manifest["content_digest"]
         self.evidence.checks[str(record["id"])] = value
         return value
 
@@ -423,4 +442,19 @@ async def recover_code_resources(store, settings):
             WHERE c.run_id=r.id AND c.status='running' AND
             (r.status IN ('failed','cancelled','completed') OR r.lease_until<=clock_timestamp())""",
             (Jsonb(interrupted), fingerprint(interrupted)),
+        )
+
+        # Recovery never restarts an interrupted observation.
+        observed = {
+            "status": "inconclusive",
+            "details": "Execution interrupted",
+            "complete": False,
+            "limitations": ["interrupted_execution"],
+        }
+        await conn.execute(
+            """UPDATE agent.code_review_reproductions c SET status='inconclusive',result=%s,
+            result_digest=%s,finished_at=clock_timestamp() FROM agent.runs r
+            WHERE c.run_id=r.id AND c.status='running' AND
+            (r.status IN ('failed','cancelled','completed') OR r.lease_until<=clock_timestamp())""",
+            (Jsonb(observed), fingerprint(observed)),
         )

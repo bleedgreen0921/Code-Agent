@@ -89,3 +89,5 @@ Run 详情、列表和 trace 增加 verification；Task 详情关联 current_run
 报告契约见 contracts/code.py。模型仅填写 AnalysisReportV1；服务端补充任务、Run、
 快照、提交、检查结果、正式产物 ID。源码引用必须来自本 Run 实际读取的完整行，
 Git index/commit 引用须明确标记来源。执行结论引用服务端检查记录。
+
+Review 使用独立的 `contracts/review.py`：`CodeReviewCreate`、三类固定 target 和 `ReviewReportV1`，不扩充旧 `AnalysisReportV1`。同一 `/v1/code/tasks` 入口按 stage 分派，省略 stage 保持 analysis 默认值；Review 报告中的 authority、coverage 和执行记录由服务端生成。用法见 [固定范围 Review](../docs/code-review.md)。

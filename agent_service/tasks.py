@@ -165,14 +165,15 @@ class TaskStore:
             ).fetchone()
             if _code:
                 await conn.execute(
-                    """INSERT INTO agent.code_tasks(task_id,request,policy_fingerprint,check_suite_id,check_ids)
-                    VALUES(%s,%s,%s,%s,%s)""",
+                    """INSERT INTO agent.code_tasks(task_id,request,policy_fingerprint,check_suite_id,check_ids,stage)
+                    VALUES(%s,%s,%s,%s,%s,%s)""",
                     (
                         row["id"],
                         Jsonb(_code["request"]),
                         binding["fingerprint"],
                         _code["suite"],
                         Jsonb(list(_code["checks"])),
+                        _code["request"]["stage"],
                     ),
                 )
             for dep in dependencies:

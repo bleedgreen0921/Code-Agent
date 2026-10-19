@@ -1,0 +1,39 @@
+# Shared trusted registration: python -m scripts.code_analysis_example --role api|worker|doctor
+# AGENT_RUN_TIMEOUT=600 gives Review its full stage budget; analysis stays capped at 300.
+version = 1
+
+[execution]
+image = "sha256:REPLACE_WITH_64_HEX_DIGITS"
+# user = "1000:1000"
+
+[[workspaces]]
+id = "project"
+root = "/ABSOLUTE/PATH/TO/project"
+
+[code_review]
+# Disabled until deployment acceptance, including human semantic review, is complete.
+enabled = false
+storage_root = "/ABSOLUTE/PATH/TO/managed-code"
+model_calls = 24
+tool_calls = 48
+run_seconds = 600
+check_calls = 12
+reproduction_calls = 4
+check_seconds = 60
+snapshot_seconds = 60
+reserve_seconds = 30
+diff_bytes = 16777216
+patch_bytes = 2097152
+
+# These optional checks use the existing trusted Python registry.
+[code_review.check_suites]
+project-python = ["project-unittest", "project-pytest"]
+
+[code_review.workspace_suites]
+project = ["project-python"]
+
+[code_review.default_suites]
+project = "project-python"
+
+# When enabling analysis in the same service, its storage_root must be identical.
+# Its check suite grants and default suite are independently configured.
